@@ -45,4 +45,6 @@ AWS::RDS::DBInstance	ReadReplicaDBInstanceIdentifiers	read replicas are not emul
 AWS::RDS::DBInstance	ResumeFullAutomationModeTime	RDS Custom automation mode is not emulated
 AWS::RDS::DBInstance	SecondaryAvailabilityZone	multi-AZ secondary placement is not emulated
 AWS::RDS::DBInstance	StatusInfos	read-replica status detail is not emulated
+AWS::Redshift::Cluster	DeferMaintenanceIdentifier	Floci does not emulate deferred maintenance windows
+AWS::Redshift::Cluster	MasterPasswordSecretArn	only set when ManageMasterPassword is true, which Floci rejects
 AWS::SQS::QueuePolicy	Id	schema gives no description; the policy has no backing entity to take an id from
