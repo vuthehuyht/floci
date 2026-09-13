@@ -19,6 +19,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -550,6 +551,46 @@ class DynamoDbStreamsEventSourcePollerTest {
         assertTrue(dlqPayload.path("DDBStreamBatchInfo").has("approximateArrivalOfFirstRecord"));
         assertTrue(dlqPayload.path("DDBStreamBatchInfo").has("approximateArrivalOfLastRecord"));
         assertFalse(dlqPayload.has("hasBeenTruncated"));
+    }
+
+    @Test
+    void onFailurePayloadUsesEpochSecondsNotMillisForArrivalTimestamps() throws Exception {
+        // Chosen so the seconds/millis interpretations land 46+ years apart: a millis bug cannot
+        // accidentally parse back to this epoch-seconds value.
+        long knownEpochSeconds = 1_700_000_000L;
+        DynamoDbStreamRecord rec = ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}");
+        rec.setApproximateCreationDateTime(knownEpochSeconds);
+        stubTrimHorizon(List.of(rec));
+
+        InvokeResult err = new InvokeResult();
+        err.setFunctionError("Unhandled");
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(err);
+
+        EsmStore store = mock(EsmStore.class);
+        EventSourceMapping esm = filterEsm();
+        esm.setMaximumRetryAttempts(0); // exhausts on the first failure
+
+        String sqsArn = "arn:aws:sqs:us-east-1:000000000000:my-dlq";
+        EventSourceMapping.DestinationConfig destConfig = new EventSourceMapping.DestinationConfig();
+        EventSourceMapping.OnFailure onFailure = new EventSourceMapping.OnFailure();
+        onFailure.setDestination(sqsArn);
+        destConfig.setOnFailure(onFailure);
+        esm.setDestinationConfig(destConfig);
+
+        DynamoDbStreamsEventSourcePoller p = pollerWith(store);
+        p.pollAndInvoke(esm);
+
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+        verify(sqsService, timeout(2000)).sendMessage(anyString(), bodyCaptor.capture(), anyInt(), anyString());
+
+        JsonNode dlqPayload = OBJECT_MAPPER.readTree(bodyCaptor.getValue());
+        Instant first = Instant.parse(
+                dlqPayload.path("DDBStreamBatchInfo").path("approximateArrivalOfFirstRecord").asText());
+        Instant last = Instant.parse(
+                dlqPayload.path("DDBStreamBatchInfo").path("approximateArrivalOfLastRecord").asText());
+        assertEquals(knownEpochSeconds, first.getEpochSecond());
+        assertEquals(knownEpochSeconds, last.getEpochSecond());
     }
 
     @Test
