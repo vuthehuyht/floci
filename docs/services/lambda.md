@@ -45,6 +45,15 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `GetFunctionConcurrency` | Get reserved concurrent executions |
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
 | `GetAccountSettings` | Account limits plus usage derived from the caller's stored functions |
+| `PutFunctionEventInvokeConfig` | Set the asynchronous invocation settings of a function, version or alias (retries, event age, destinations) |
+| `UpdateFunctionEventInvokeConfig` | Change some of those settings, leaving the rest as they are |
+| `GetFunctionEventInvokeConfig` | Read the asynchronous invocation settings |
+| `DeleteFunctionEventInvokeConfig` | Remove the asynchronous invocation settings |
+| `ListFunctionEventInvokeConfigs` | List the asynchronous invocation settings of every version and alias of a function |
+
+The event invoke configuration is stored and returned as AWS does, and `AWS::Lambda::EventInvokeConfig`
+provisions it from a stack. Asynchronous invocations do not yet apply its retry, event age or
+destination settings.
 
 ## Hot-Reloading via Reactive S3 Sync
 
@@ -205,7 +214,6 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 
 - Layer permissions (`AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
 - Provisioned concurrency (`PutProvisionedConcurrencyConfig`, `GetProvisionedConcurrencyConfig`, `ListProvisionedConcurrencyConfigs`, `DeleteProvisionedConcurrencyConfig`)
-- Dead-letter, async invoke config, and event invoke config operations
 - `InvokeWithResponseStream`
 - Code signing management (only `GetFunctionCodeSigningConfig` and `ListFunctionsByCodeSigningConfig` are wired; there is no `PutFunctionCodeSigningConfig` or `CreateCodeSigningConfig`, so no code-signing config can exist and `ListFunctionsByCodeSigningConfig` reports every well-formed ARN as `ResourceNotFoundException` — a malformed ARN or an out-of-range `MaxItems` is rejected with `InvalidParameterValueException` first)
 
@@ -375,7 +383,7 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get", "watch"]
-  # Only needed when FLOCI_TLS_ENABLED=true (CA cert is shared via a ConfigMap)
+  # Only needed when FLOCI_TLS_ENABLED=true (the CA bundle is shared via a ConfigMap)
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["create", "get", "update", "patch"]
@@ -532,7 +540,9 @@ is a permanent diff rather than a cosmetic omission.
 `[.\-_/#A-Za-z0-9]+`. `ApplicationLogLevel` and `SystemLogLevel` are accepted with any
 `LogFormat` but are only ever stored — and therefore only ever returned — when the
 resolved format is `JSON`; supplying them with `LogFormat=Text` is not an error, it is
-simply a no-op, matching the fact that the response never surfaces them for Text.
+simply a no-op. That is Floci's own call rather than probed AWS behaviour: it keeps the
+request path consistent with Floci's response shape, which never surfaces the levels for
+Text.
 
 `VpcConfig` is omitted entirely while the function is not attached to a VPC.
 Subnets that EC2 does not know about are still accepted and returned; only `VpcId`
@@ -734,6 +744,29 @@ aws lambda create-event-source-mapping \
   --function-name my-function \
   --event-source-arn $QUEUE_ARN \
   --batch-size 10 \
+  --endpoint-url $AWS_ENDPOINT_URL
+```
+
+### MaximumBatchingWindowInSeconds (SQS)
+
+`CreateEventSourceMapping` and `UpdateEventSourceMapping` accept a
+`MaximumBatchingWindowInSeconds` integer between 0 and 300. `GetEventSourceMapping`
+and `ListEventSourceMappings` echo it back when set; responses omit the field when
+it was never configured. Values outside 0 to 300 are rejected with
+`InvalidParameterValueException`.
+
+When the window is greater than 0, the SQS poller holds an underfilled batch open,
+accumulating messages across polls, and invokes the function once the batch reaches
+`BatchSize` or the window elapses since the first buffered message, whichever comes
+first. A window of 0 (or an unset window) invokes as soon as any message is
+available, which is the previous behaviour.
+
+```bash
+aws lambda create-event-source-mapping \
+  --function-name my-function \
+  --event-source-arn $QUEUE_ARN \
+  --batch-size 10 \
+  --maximum-batching-window-in-seconds 5 \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
 

@@ -67,6 +67,22 @@ class KmsServiceTest {
         );
     }
 
+    /**
+     * Round-trip in a non-commercial partition. The key ARN a GovCloud or China deployment mints
+     * carries that partition, and resolving a key by ARN used to test
+     * {@code startsWith("arn:aws:kms:")}, so the emulator refused to find a key it had just
+     * created and reported NotFound for a key that exists.
+     */
+    @Test
+    void resolvesAKeyByItsOwnArnInAnyPartition() {
+        for (String region : List.of("us-gov-west-1", "cn-north-1", "us-east-1")) {
+            KmsKey created = kmsService.createKey("partition key", region);
+
+            assertEquals(created.getKeyId(), kmsService.describeKey(created.getArn(), region).getKeyId(),
+                    "key in " + region + " was not resolvable by its own ARN " + created.getArn());
+        }
+    }
+
     @Test
     void createKeyAndDescribe() {
         KmsKey key = kmsService.createKey("my test key", REGION);
@@ -76,6 +92,31 @@ class KmsServiceTest {
         assertTrue(key.getArn().contains("key/"));
         assertEquals("my test key", key.getDescription());
         assertEquals("Enabled", key.getKeyState());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "cn-fake-1"})
+    void createSm2KeyReportsRegionUnsupportedOperation(String region) {
+        AwsException exception = assertThrows(AwsException.class, () ->
+                kmsService.createKey(null, "SIGN_VERIFY", "SM2", null, Map.of(), region));
+
+        assertEquals("UnsupportedOperationException", exception.getErrorCode());
+        assertEquals("KeySpec SM2 is not supported in this Region", exception.getMessage());
+        assertEquals(400, exception.getHttpStatus());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"cn-north-1", "cn-northwest-1"})
+    void createSm2KeySucceedsInChinaRegions(String region) {
+        KmsKey key = kmsService.createKey(null, "SIGN_VERIFY", "SM2", null, Map.of(), region);
+        byte[] message = "SM2 regional signing".getBytes(StandardCharsets.UTF_8);
+        byte[] signature = kmsService.sign(key.getKeyId(), message, "SM2DSA", region);
+
+        assertEquals(KmsKeySpec.SM2, key.getKeySpec());
+        assertEquals(KmsKeyUsage.SIGN_VERIFY, key.getKeyUsage());
+        assertNotNull(key.getPrivateKeyEncoded());
+        assertNotNull(key.getPublicKeyEncoded());
+        assertTrue(kmsService.verify(key.getKeyId(), message, signature, "SM2DSA", region));
     }
 
     @Test

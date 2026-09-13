@@ -62,9 +62,34 @@ A `Retry` re-entry emits its own Scheduled, Started, and Failed triple for each 
 mocked Task (`SFN_MOCK_CONFIG`) emits the same events as a real one, because Step Functions
 Local does the same.
 
-Every event's `previousEventId` points to the id of the event right before it. The one
-exception is the first state's `*StateEntered` event. Its `previousEventId` is `0`. That
-matches `ExecutionStarted`, which is always `id: 1, previousEventId: 0`.
+Every event's `previousEventId` points to the id of the event right before it on the same
+chain of states. The one exception is the first state's `*StateEntered` event. Its
+`previousEventId` is `0`. That matches `ExecutionStarted`, which is always
+`id: 1, previousEventId: 0`.
+
+### Parallel branches and Map iterations
+
+The states inside a `Parallel` branch or an inline `Map` iteration publish their events into
+the parent execution's history, as on AWS. A `Parallel` records `ParallelStateStarted`,
+`ParallelStateSucceeded` and `ParallelStateFailed`. An inline `Map` records `MapStateStarted`,
+`MapIterationStarted`, `MapIterationSucceeded`, `MapIterationFailed`, `MapStateSucceeded` and
+`MapStateFailed`. A Distributed `Map` records `MapRunStarted`, `MapRunSucceeded` and
+`MapRunFailed` instead. Its items are child executions and publish nothing into the parent
+history. A `Task` whose failure ends its branch also records `TaskStateAborted`.
+
+Branches and iterations run concurrently, so the order in which their events interleave differs
+from run to run. Each branch chains its own events through `previousEventId`, and that chain is
+the same every time.
+
+### The cause of a failure
+
+The `cause` of a failure the interpreter raises starts with
+`An error occurred while executing the state '<name>' (entered at the event id #<n>). `, as on
+AWS. The prefix is added once, at the innermost state. A `Fail` state's `Cause` and a cause a
+task's resource answered with pass through unchanged. A `Choice` that matches no rule and has
+no `Default`, and a payload template path that matches nothing, fail with `States.Runtime`.
+A JSONata expression that fails also records an `EvaluationFailed` event with `error`, `cause`,
+`location` and `state`, once per attempt.
 
 `inputDetails` appears on `ExecutionStarted`, on `stateEnteredEventDetails`, and on
 `LambdaFunctionScheduled`/`ActivityScheduled`. `outputDetails` appears on
@@ -76,9 +101,12 @@ When the request sets `includeExecutionData` to false, the details objects stay 
 `taskScheduledEventDetails.parameters`. This matches AWS.
 
 A few gaps remain. `TaskStarted`, `LambdaFunctionStarted`, and `ActivityStarted` fire at
-scheduling time, not when a worker actually picks up the task. Events inside a `Parallel` or
-`Map` branch are not recorded in the parent execution's history. `TaskSubmitted`, which real
-AWS emits for `.sync` and `.waitForTaskToken` integrations, is not emitted yet.
+scheduling time, not when a worker actually picks up the task. `TaskSubmitted`, which real
+AWS emits for `.sync` and `.waitForTaskToken` integrations, is not emitted yet. When a
+branch fails, AWS records `*StateAborted` and `MapIterationAborted` events for the states its
+sibling branches were in; Floci cancels the siblings without recording them. A Distributed
+`Map` whose item fails reports the item's own error rather than AWS's
+`States.ExceedToleratedFailureThreshold`, and emits `MapRunFailed` with that error.
 
 ## Map concurrency
 
@@ -187,9 +215,8 @@ index: `Output`, `Output/a/b[0]`, `Assign/x`, `Arguments/MessageGroupId`, `Choic
 `Choices[1]/Output/v`, `Choices[0]/Assign/x`, `Catch[1]/Output/v`. A `Choice` stops at the first rule
 that matches, so an undefined condition in a later rule is never evaluated.
 
-One deviation. AWS prefixes the cause of a real execution with
-`An error occurred while executing the state '<name>' (entered at the event id #<n>).`; Floci
-returns the cause without it, which is the form AWS's own `TestState` returns.
+The cause of a real execution carries the state prefix described under
+[The cause of a failure](#the-cause-of-a-failure).
 
 ## JSONata functions
 
@@ -330,10 +357,40 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 | `arn:aws:states:::aws-sdk:sfn:sendTaskFailure` | `{}` | `Sfn.InvalidTokenException` |
 | `arn:aws:states:::aws-sdk:scheduler:createSchedule` | `{ScheduleArn}` | `Scheduler.ConflictException` when the name is taken |
 | `arn:aws:states:::aws-sdk:scheduler:updateSchedule` | `{ScheduleArn}` | `Scheduler.ResourceNotFoundException` |
+| `arn:aws:states:::aws-sdk:sns:publish` | `{MessageId}` | `Sns.NotFoundException` when the topic does not exist |
 
 `sendTaskSuccess` and `sendTaskFailure` resolve a token a `.waitForTaskToken` task is parked on. A
 token nobody is waiting for fails the calling task rather than reporting a delivery that never
 happened.
+
+## Publishing to SNS
+
+`arn:aws:states:::sns:publish` calls the SNS Publish API with the task's parameters and returns the
+Publish response, `{MessageId}`. `TopicArn`, `TargetArn`, `PhoneNumber`, `Message`, `Subject`,
+`MessageStructure`, `MessageAttributes`, `MessageGroupId` and `MessageDeduplicationId` are the API's
+own fields, so a FIFO topic needs a `MessageGroupId` here just as it does from the SDK. A `Message`
+given as an object rather than a string is published as its JSON text, which is how a
+`.waitForTaskToken` task hands its token to the subscriber:
+
+```json
+{
+  "Type": "Task",
+  "Resource": "arn:aws:states:::sns:publish.waitForTaskToken",
+  "Parameters": {
+    "TopicArn": "arn:aws:sns:us-east-1:000000000000:myTopic",
+    "Message": {
+      "Input.$": "$.message",
+      "TaskToken.$": "$$.Task.Token"
+    }
+  },
+  "End": true
+}
+```
+
+A failure names the SDK exception class under the `SNS.` prefix, so a topic that does not exist
+fails the task with `SNS.NotFoundException` and a missing `Message` with
+`SNS.InvalidParameterException`. `arn:aws:states:::aws-sdk:sns:publish` is the same call under the
+`Sns.` prefix, as the AWS SDK integration table above shows.
 
 ## Publishing events
 
@@ -381,6 +438,39 @@ terminal state (`MISSING_END_STATE`), for a `StartAt`, `Next`, `Default` or `Cat
 state absent from its container or a state nothing transitions to (`MISSING_TRANSITION_TARGET`),
 and for a field the state type does not carry: `TimeoutSeconds` only on `Task`, and `Catch`/`Retry`
 only on `Task`, `Parallel` and `Map`.
+
+## A state's QueryLanguage, and the fields it may carry
+
+A state's query language is JSONPath when its `QueryLanguage` field is exactly the string
+`"JSONPath"`, the state machine's when the field is absent, and JSONata for any other value: the
+wrong case, an unknown string and a non-string alike. A state inside a `Map`'s `ItemProcessor` or `Iterator`, or
+inside one of a `Parallel`'s `Branches`, falls back to the **state machine's** language and not to
+the enclosing `Map`'s or `Parallel`'s, which the Amazon States Language calls independent of it. The
+enclosing state's own fields, `Items` and `MaxConcurrency` among them, do use its own language.
+
+Three more refusals, each measured against `ValidateStateMachineDefinition` on real AWS:
+
+- A field that belongs to the other query language, at the state's path with no field suffix:
+  `The QueryLanguage is set to 'JSONPath', but field 'Output' is only supported for the 'JSONata'
+  QueryLanguage`, and the mirror of it for `InputPath`, `OutputPath`, `ResultPath`,
+  `ResultSelector`, `Parameters`, `Result`, `ItemsPath` and `MaxConcurrencyPath` on a JSONata
+  state. `Assign` belongs to neither list: AWS accepts it on both.
+- A state declaring `"QueryLanguage": "JSONPath"` under a `JSONata` state machine:
+  `'QueryLanguage' can not be 'JSONPath' if set to 'JSONata' for whole state machine`, again at the
+  state's path. A JSONata machine cannot be reverted one state at a time; the upgrade in the other
+  direction is allowed. That diagnostic is the whole answer for that state, so the fields its
+  refused language forbids are not reported on top of it, while every other check still runs.
+- `QueryLanguage` on the `ItemProcessor`, `Iterator` or branch object itself, which is not a state:
+  `Field 'QueryLanguage' is not supported` at `/States/M/ItemProcessor`.
+
+A `QueryLanguage` value outside the enum is reported at the field, `/States/X/QueryLanguage` or
+`/QueryLanguage`, with `Value should be one of the following: [JSONPath, JSONata]`, and a
+non-string value with `Expected value of type [STRING]`. That diagnostic is independent of the
+resolution above, so `"jsonpath"` is a JSONata state that also carries it, and it is not a
+downgrade: only the exact string `"JSONPath"` under a JSONata machine is.
+
+Locations follow AWS: the two messages above point at the state, `/States/X`, while every other
+schema error points at the offending field, `/States/X/MaxConcurrency`.
 
 ## Mocked service integrations
 
@@ -438,6 +528,24 @@ A mocked response with no attempt entries (`{}`) is not rejected. As in Step Fun
 Local, the execution starts and fails with `States.Runtime` only if the state that names
 it is entered. This keeps a generated mock file usable when the collection it was built
 from is empty and the state is never reached.
+
+## Executions abandoned by a restart
+
+An execution runs in the Floci process. When Floci restarts while an execution is `RUNNING`,
+no worker survives it, so at startup every execution still stored as `RUNNING` is aborted with no
+error and no cause, the shape AWS returns for `StopExecution` called without them:
+`DescribeExecution` reports `status` `ABORTED` and a `stopDate`, and leaves the `error` and `cause`
+keys out. How many executions the sweep retired is reported once, as a `WARN` log line. Executions
+of every account are swept, each written back under its own account. Executions that already
+reached a terminal status are left untouched, and so is the status and `stopDate` of one this sweep
+aborted on an earlier boot.
+
+Execution history is stored with the execution. While an execution is running, the current history
+is checkpointed every 100 events and when the execution reaches a terminal state. A graceful
+shutdown flushes the current execution state before the emulator stops. On restart, persisted
+history is retained, and a previously running execution is marked `ABORTED` with one
+`ExecutionAborted` event appended. After a further restart, the execution is already terminal, so
+no additional event is written.
 
 ## Configuration
 

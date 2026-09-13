@@ -8,8 +8,11 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.organizations.OrganizationsService;
 import io.github.hectorvent.floci.services.ram.model.PrincipalAssociation;
 import io.github.hectorvent.floci.services.ram.model.ResourceShare;
+import io.github.hectorvent.floci.services.ram.model.ResourceShareInvitation;
 import io.github.hectorvent.floci.services.ram.model.SharedResource;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -35,7 +38,7 @@ import java.util.Map;
  * <p>Serves the RAM calls AWS Landing Zone Accelerator makes: the organization-sharing opt-in
  * plus the share reads of the Custom::GetResourceShare / Custom::GetResourceShareItem Lambdas.
  * The literal paths take JAX-RS precedence over S3's {@code /{bucket}} template route, so no
- * extra routing wiring is needed — but any RAM path missing here falls through to S3 and
+ * extra routing wiring is needed, but any RAM path missing here falls through to S3 and
  * produces an XML error a restJson1 client cannot parse.
  */
 @Path("/")
@@ -47,22 +50,33 @@ public class RamController {
     private final ObjectMapper objectMapper;
     private final ObjectReader requestReader;
     private final RegionResolver regionResolver;
+    private final OrganizationsService organizationsService;
+    private final IamService iamService;
 
     @Inject
-    public RamController(RamService service, ObjectMapper objectMapper, RegionResolver regionResolver) {
+    public RamController(RamService service, ObjectMapper objectMapper, RegionResolver regionResolver,
+                         OrganizationsService organizationsService, IamService iamService) {
         this.service = service;
         this.objectMapper = objectMapper;
         this.requestReader = objectMapper.reader()
                 .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
         this.regionResolver = regionResolver;
+        this.organizationsService = organizationsService;
+        this.iamService = iamService;
     }
 
     @POST
     @Path("/enablesharingwithawsorganization")
     @Consumes(MediaType.WILDCARD)
     public Response enableSharingWithAwsOrganization() {
+        String callerAccountId = regionResolver.getAccountId();
+        organizationsService.enableAWSServiceAccess(callerAccountId, "ram.amazonaws.com");
+        if (iamService.findRole(callerAccountId, "AWSServiceRoleForResourceAccessManager").isEmpty()) {
+            iamService.createServiceLinkedRole("ram.amazonaws.com", null,
+                    "Allows AWS Resource Access Manager to access AWS Organizations on your behalf.");
+        }
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("returnValue", service.enableSharingWithAwsOrganization());
+        response.put("returnValue", service.enableSharingWithAwsOrganization(regionResolver.getAccountId()));
         return Response.ok(response).build();
     }
 
@@ -227,12 +241,62 @@ public class RamController {
     @Path("/getresourceshareinvitations")
     @Consumes(MediaType.WILDCARD)
     public Response getResourceShareInvitations(String body) {
-        // The body is semantically ignored (invitations are always empty under
-        // organization sharing) but malformed JSON is still a client error.
-        readTree(body);
+        JsonNode request = readTree(body);
+        List<ResourceShareInvitation> invitations = service.getResourceShareInvitations(
+                regionResolver.getAccountId(),
+                stringList(request.path("resourceShareArns")),
+                stringList(request.path("resourceShareInvitationArns")));
+
         ObjectNode response = objectMapper.createObjectNode();
-        response.set("resourceShareInvitations", objectMapper.createArrayNode());
+        ArrayNode array = objectMapper.createArrayNode();
+        invitations.forEach(invitation -> array.add(invitationNode(invitation)));
+        response.set("resourceShareInvitations", array);
         return Response.ok(response).build();
+    }
+
+    @POST
+    @Path("/acceptresourceshareinvitation")
+    @Consumes(MediaType.WILDCARD)
+    public Response acceptResourceShareInvitation(String body) {
+        JsonNode request = readTree(body);
+        String clientToken = request.hasNonNull("clientToken") ? request.path("clientToken").asText() : null;
+        ResourceShareInvitation invitation = service.acceptResourceShareInvitation(
+                request.path("resourceShareInvitationArn").asText(), regionResolver.getAccountId());
+        return invitationResponse(invitation, clientToken);
+    }
+
+    @POST
+    @Path("/rejectresourceshareinvitation")
+    @Consumes(MediaType.WILDCARD)
+    public Response rejectResourceShareInvitation(String body) {
+        JsonNode request = readTree(body);
+        String clientToken = request.hasNonNull("clientToken") ? request.path("clientToken").asText() : null;
+        ResourceShareInvitation invitation = service.rejectResourceShareInvitation(
+                request.path("resourceShareInvitationArn").asText(), regionResolver.getAccountId());
+        return invitationResponse(invitation, clientToken);
+    }
+
+    private Response invitationResponse(ResourceShareInvitation invitation, String clientToken) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("resourceShareInvitation", invitationNode(invitation));
+        // Echoes what the caller sent (or, per AWS, a generated one if it sent none); floci
+        // has no need to invent one when absent since nothing here retries on it.
+        if (clientToken != null) {
+            response.put("clientToken", clientToken);
+        }
+        return Response.ok(response).build();
+    }
+
+    private ObjectNode invitationNode(ResourceShareInvitation invitation) {
+        ObjectNode node = objectMapper.createObjectNode();
+        node.put("resourceShareInvitationArn", invitation.resourceShareInvitationArn());
+        node.put("resourceShareArn", invitation.resourceShareArn());
+        node.put("resourceShareName", invitation.resourceShareName());
+        node.put("senderAccountId", invitation.senderAccountId());
+        node.put("receiverAccountId", invitation.receiverAccountId());
+        node.put("invitationTimestamp", invitation.invitationTimestamp().toEpochMilli() / 1000.0);
+        node.put("status", invitation.status());
+        return node;
     }
 
     @POST

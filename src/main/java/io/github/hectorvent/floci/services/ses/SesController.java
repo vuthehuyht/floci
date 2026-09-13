@@ -115,41 +115,18 @@ public class SesController {
                 configurationSetName = configSetNode.textValue();
             }
 
-            if (sesService.getIdentityVerificationAttributes(emailIdentity, region) != null) {
-                throw new AwsException("AlreadyExistsException",
-                        "Email identity " + emailIdentity + " already exist.", 400);
-            }
-
-            // Parse Tags up front. parseTagsArray is pure (it only reads the node), so validating the
-            // shape before creating the identity keeps the call atomic — a malformed Tags value fails
-            // without leaving a half-created identity behind, matching AWS and the ConfigurationSetName
-            // pre-check below.
             List<Tag> parsedTags = parseTagsArray(request.path("Tags"));
-            // Validate tags before creating the identity so an invalid set fails atomically
-            // instead of leaving the identity behind.
-            SesTags.validate(parsedTags);
 
-            // Verified against AWS: a non-existent ConfigurationSetName fails the whole call
-            // (NotFoundException) without creating the identity, so validate it before creating.
             // Only the empty string means "no default configuration set" (consistent with the
             // PutEmailIdentityConfigurationSetAttributes path); a whitespace-only name flows through
             // name validation and is rejected as invalid input, rather than being silently ignored.
             boolean hasConfigSet = configurationSetName != null && !configurationSetName.isEmpty();
-            if (hasConfigSet) {
-                sesService.getConfigurationSet(configurationSetName, region);
-            }
 
-            Identity identity = emailIdentity.contains("@")
-                    ? sesService.verifyEmailIdentity(emailIdentity, region)
-                    : sesService.verifyDomainIdentity(emailIdentity, region);
-
-            if (hasConfigSet) {
-                sesService.setEmailIdentityConfigurationSet(emailIdentity, configurationSetName, region);
-            }
-
-            if (parsedTags != null) {
-                sesService.setIdentityTags(emailIdentity, region, parsedTags);
-            }
+            // The service builds the complete identity (default configuration set and tags included)
+            // and persists it with a single write, so any failure (AlreadyExists, invalid tags, a
+            // missing configuration set) fails the whole call and creates nothing, matching AWS.
+            Identity identity = sesService.createEmailIdentity(emailIdentity,
+                    hasConfigSet ? configurationSetName : null, parsedTags, region);
 
             ObjectNode result = objectMapper.createObjectNode();
             result.put("IdentityType", toV2IdentityType(identity.getIdentityType()));
@@ -568,7 +545,7 @@ public class SesController {
                 if (hasName || hasArn) {
                     String resolvedName = hasName
                             ? templateName
-                            : SesService.templateNameFromArn(templateArn);
+                            : SesTemplateService.templateNameFromArn(templateArn);
                     sesService.checkTenantSendAccess(tenantName, fromEmailAddress,
                             configurationSetName, resolvedName, regionResolver.getAccountId(), region);
                     messageId = sesService.sendTemplatedEmail(fromEmailAddress, toAddresses, ccAddresses,
@@ -666,7 +643,7 @@ public class SesController {
             } else {
                 String resolvedName = hasName
                         ? templateName
-                        : SesService.templateNameFromArn(templateArn);
+                        : SesTemplateService.templateNameFromArn(templateArn);
                 gateTemplateName = resolvedName;
                 EmailTemplate stored = sesService.getTemplate(resolvedName, region);
                 subject = stored.getSubject();
@@ -1904,6 +1881,36 @@ public class SesController {
         return Response.ok(result).build();
     }
 
+    @PUT
+    @Path("/dedicated-ip-pools/{poolName}/scaling")
+    public Response putDedicatedIpPoolScalingAttributes(@Context HttpHeaders headers,
+                                                        @PathParam("poolName") String poolName,
+                                                        String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            JsonNode request = readOptionBody(body);
+            String scalingMode = parseOptionString(request.path("ScalingMode"), "ScalingMode");
+            sesService.putDedicatedIpPoolScalingAttributes(poolName, scalingMode, region);
+            LOG.infov("SES V2 PutDedicatedIpPoolScalingAttributes on {0}", poolName);
+            return Response.ok(objectMapper.createObjectNode()).build();
+        } catch (AwsException e) {
+            throw remapV1Exception(e);
+        }
+    }
+
+    // ──────────────────────── Dedicated IPs (IP-level) ────────────────────────
+
+    @GET
+    @Path("/dedicated-ips")
+    public Response getDedicatedIps(@Context HttpHeaders headers) {
+        regionResolver.resolveRegion(headers);
+        // Floci does not model leased dedicated IPs, so the account has none.
+        ObjectNode result = objectMapper.createObjectNode();
+        result.putArray("DedicatedIps");
+        result.putNull("NextToken");
+        return Response.ok(result).build();
+    }
+
     @GET
     @Path("/contact-lists/{contactListName}")
     public Response getContactList(@Context HttpHeaders headers,
@@ -2183,6 +2190,59 @@ public class SesController {
         return result;
     }
 
+    @GET
+    @Path("/dedicated-ips/{ip}")
+    public Response getDedicatedIp(@Context HttpHeaders headers, @PathParam("ip") String ip) {
+        String region = regionResolver.resolveRegion(headers);
+        sesService.getDedicatedIp(ip, region);
+        return Response.ok(objectMapper.createObjectNode()).build();
+    }
+
+    @PUT
+    @Path("/dedicated-ips/{ip}/pool")
+    public Response putDedicatedIpInPool(@Context HttpHeaders headers,
+                                         @PathParam("ip") String ip, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            JsonNode request = readOptionBody(body);
+            String destinationPoolName = parseOptionString(
+                    request.path("DestinationPoolName"), "DestinationPoolName");
+            sesService.putDedicatedIpInPool(ip, destinationPoolName, region);
+            LOG.infov("SES V2 PutDedicatedIpInPool: {0}", ip);
+            return Response.ok(objectMapper.createObjectNode()).build();
+        } catch (AwsException e) {
+            throw remapV1Exception(e);
+        }
+    }
+
+    @PUT
+    @Path("/dedicated-ips/{ip}/warmup")
+    public Response putDedicatedIpWarmupAttributes(@Context HttpHeaders headers,
+                                                   @PathParam("ip") String ip, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            JsonNode request = readOptionBody(body);
+            sesService.putDedicatedIpWarmupAttributes(ip,
+                    parseWarmupPercentage(request.path("WarmupPercentage")), region);
+            LOG.infov("SES V2 PutDedicatedIpWarmupAttributes: {0}", ip);
+            return Response.ok(objectMapper.createObjectNode()).build();
+        } catch (AwsException e) {
+            throw remapV1Exception(e);
+        }
+    }
+
+    // JSON-layer concern only: a non-integer WarmupPercentage is a SerializationException,
+    // matching AWS. Required/range validation lives in the service.
+    private static Integer parseWarmupPercentage(JsonNode node) {
+        if (node.isMissingNode() || node.isNull()) {
+            return null;
+        }
+        if (!node.isInt()) {
+            throw new AwsException("SerializationException", null, 400);
+        }
+        return node.intValue();
+    }
+
     // ──────────────────────────── Account ────────────────────────────
 
     @GET
@@ -2194,7 +2254,7 @@ public class SesController {
         AccountSuppressionAttributes suppression = sesService.getAccountSuppressionAttributes(region);
 
         ObjectNode result = objectMapper.createObjectNode();
-        result.put("DedicatedIpAutoWarmupEnabled", false);
+        result.put("DedicatedIpAutoWarmupEnabled", sesService.isAccountDedicatedIpAutoWarmupEnabled(region));
         result.put("EnforcementStatus", "HEALTHY");
         result.put("ProductionAccessEnabled", true);
         result.put("SendingEnabled", sendingEnabled);
@@ -2394,6 +2454,25 @@ public class SesController {
                 "1 validation error detected: Value at '" + path
                         + "' failed to satisfy constraint: Member must satisfy enum value set: [ENABLED, DISABLED]",
                 400);
+    }
+
+    @PUT
+    @Path("/account/dedicated-ips/warmup")
+    public Response putAccountDedicatedIpWarmupAttributes(@Context HttpHeaders headers, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            JsonNode request = readOptionBody(body);
+            JsonNode enabledNode = request.path("AutoWarmupEnabled");
+            // AutoWarmupEnabled has a default of false: the SDK omits it when false, so a missing
+            // member is treated as false rather than rejected. A present value goes through the
+            // shared SES v2 boolean coercion (string→true, null/number/container→SerializationException).
+            boolean enabled = enabledNode.isMissingNode() ? false : coerceBoolean(enabledNode);
+            sesService.setAccountDedicatedIpAutoWarmup(region, enabled);
+            LOG.infov("SES V2 PutAccountDedicatedIpWarmupAttributes: {0}", enabled);
+            return Response.ok(objectMapper.createObjectNode()).build();
+        } catch (AwsException e) {
+            throw remapV1Exception(e);
+        }
     }
 
     @PUT

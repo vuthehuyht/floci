@@ -143,6 +143,12 @@ public class ResourceArnBuilder {
                     return List.of(toDynamoDbTableArn(tableName, region, accountId));
                 }
             }
+            if (json.path("TableCreationParameters").hasNonNull("TableName")) {
+                var tableName = json.path("TableCreationParameters").get("TableName").asText().trim();
+                if (!tableName.isEmpty()) {
+                    return List.of(toDynamoDbTableArn(tableName, region, accountId));
+                }
+            }
             if (json.hasNonNull("ResourceArn")) {
                 String resourceArn = json.get("ResourceArn").asText().trim();
                 if (!resourceArn.isEmpty()) {
@@ -165,6 +171,12 @@ public class ResourceArnBuilder {
                 String exportArn = json.get("ExportArn").asText().trim();
                 if (!exportArn.isEmpty()) {
                     return List.of(exportArn);
+                }
+            }
+            if (json.hasNonNull("ImportArn")) {
+                var importArn = json.get("ImportArn").asText().trim();
+                if (!importArn.isEmpty()) {
+                    return List.of(importArn);
                 }
             }
             if (json.hasNonNull("RequestItems") && json.get("RequestItems").isObject()) {
@@ -251,7 +263,7 @@ public class ResourceArnBuilder {
     }
 
     private String toDynamoDbTableArn(String tableName, String region, String accountId) {
-        if (tableName.startsWith("arn:aws:dynamodb:")) {
+        if (AwsArnUtils.isArnFor(tableName, "dynamodb")) {
             return tableName;
         }
         return AwsArnUtils.Arn.of("dynamodb", region, accountId, "table/" + tableName).toString();
@@ -270,7 +282,7 @@ public class ResourceArnBuilder {
             if (json.hasNonNull("StreamName")) {
                 String streamName = json.get("StreamName").asText().trim();
                 if (!streamName.isEmpty()) {
-                    if (streamName.startsWith("arn:aws:kinesis:")) {
+                    if (AwsArnUtils.isArnFor(streamName, "kinesis")) {
                         return streamName;
                     }
                     return AwsArnUtils.Arn.of("kinesis", region, accountId, "stream/" + streamName).toString();
@@ -293,7 +305,7 @@ public class ResourceArnBuilder {
             if (json.hasNonNull("SecretId")) {
                 String secretId = json.get("SecretId").asText().trim();
                 if (!secretId.isEmpty()) {
-                    if (secretId.startsWith("arn:aws:secretsmanager:")) {
+                    if (AwsArnUtils.isArnFor(secretId, "secretsmanager")) {
                         return secretId;
                     }
                     return AwsArnUtils.Arn.of("secretsmanager", region, accountId, "secret:" + secretId).toString();
@@ -310,7 +322,7 @@ public class ResourceArnBuilder {
             if (json.hasNonNull("Name")) {
                 String name = json.get("Name").asText().trim();
                 if (!name.isEmpty()) {
-                    if (name.startsWith("arn:aws:ssm:")) {
+                    if (AwsArnUtils.isArnFor(name, "ssm")) {
                         return name;
                     }
                     String paramResource = name.startsWith("/") ? "parameter" + name : "parameter/" + name;

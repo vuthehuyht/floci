@@ -67,9 +67,12 @@ public class Ec2QueryHandler {
                 case "StartInstances" -> handleStartInstances(params, region);
                 case "StopInstances" -> handleStopInstances(params, region);
                 case "RebootInstances" -> handleRebootInstances(params, region);
+                case "MonitorInstances" -> handleMonitoring(params, region, "MonitorInstances", true);
+                case "UnmonitorInstances" -> handleMonitoring(params, region, "UnmonitorInstances", false);
                 case "DescribeInstanceStatus" -> handleDescribeInstanceStatus(params, region);
                 case "DescribeInstanceAttribute" -> handleDescribeInstanceAttribute(params, region);
                 case "ModifyInstanceAttribute" -> handleModifyInstanceAttribute(params, region);
+                case "ModifyInstanceMetadataOptions" -> handleModifyInstanceMetadataOptions(params, region);
                 // EBS encryption defaults
                 case "GetEbsEncryptionByDefault" -> handleGetEbsEncryptionByDefault(region);
                 case "EnableEbsEncryptionByDefault" -> handleEnableEbsEncryptionByDefault(region);
@@ -109,6 +112,7 @@ public class Ec2QueryHandler {
                         handleDescribeTransitGatewayVpcAttachments(params, region);
                 case "DescribeTransitGatewayAttachments" ->
                         handleDescribeTransitGatewayAttachments(params, region);
+                case "DescribeTransitGatewayConnects" -> handleDescribeTransitGatewayConnects(params, region);
                 case "ModifyTransitGatewayVpcAttachment" ->
                         handleModifyTransitGatewayVpcAttachment(params, region);
                 case "DeleteTransitGatewayVpcAttachment" ->
@@ -167,6 +171,8 @@ public class Ec2QueryHandler {
                 case "DescribeImages" -> handleDescribeImages(params, region);
                 case "CreateImage" -> handleCreateImage(params, region);
                 case "RegisterImage" -> handleRegisterImage(params, region);
+                case "DeregisterImage" -> handleDeregisterImage(params, region);
+                case "CopyImage" -> handleCopyImage(params, region);
                 case "DescribeSnapshots" -> handleDescribeSnapshots(params, region);
                 // Tags
                 case "CreateTags" -> handleCreateTags(params, region);
@@ -252,6 +258,7 @@ public class Ec2QueryHandler {
                 case "RequestSpotInstances" -> handleRequestSpotInstances(params, region);
                 case "DescribeSpotInstanceRequests" -> handleDescribeSpotInstanceRequests(params, region);
                 case "CancelSpotInstanceRequests" -> handleCancelSpotInstanceRequests(params, region);
+                case "DescribeSpotPriceHistory" -> handleDescribeSpotPriceHistory(params, region);
                 // IPAM
                 case "EnableIpamOrganizationAdminAccount" -> handleEnableIpamOrgAdmin(params);
                 case "DisableIpamOrganizationAdminAccount" -> handleDisableIpamOrgAdmin(params);
@@ -658,8 +665,15 @@ public class Ec2QueryHandler {
             }
         }
 
+        // Absent fields stay null so the launch default, or the launch template's value, applies.
+        LaunchTemplateData.MetadataOptions metadataOptions = parseMetadataOptions(p, "MetadataOptions.");
+
         LaunchTemplateData launchTemplateData = resolveRunInstancesLaunchTemplateData(p, region);
         if (launchTemplateData != null) {
+            if (launchTemplateData.getMetadataOptions() != null) {
+                metadataOptions = LaunchTemplateData.MetadataOptions.merge(
+                        launchTemplateData.getMetadataOptions(), metadataOptions);
+            }
             imageId = firstNonBlank(imageId, launchTemplateData.getImageId());
             instanceType = firstNonBlank(instanceType, launchTemplateData.getInstanceType());
             keyName = firstNonBlank(keyName, launchTemplateData.getKeyName());
@@ -679,7 +693,7 @@ public class Ec2QueryHandler {
 
         Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
-                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex);
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions);
 
         if (!networkInterfaceTags.isEmpty()) {
             List<String> eniIds = new ArrayList<>();
@@ -1118,6 +1132,33 @@ public class Ec2QueryHandler {
         return xmlResponse(xml.build());
     }
 
+    /**
+     * Detailed monitoring is a CloudWatch billing switch with no emulated behaviour behind
+     * it, so this acknowledges the requested state without storing it. Answering matters
+     * because a single unsupported call fails an entire {@code terraform apply}: an
+     * {@code aws_instance} with {@code monitoring = true} calls MonitorInstances right
+     * after RunInstances, and rejecting it discards everything else the module built.
+     */
+    private Response handleMonitoring(MultivaluedMap<String, String> p, String region, String action,
+                                      boolean enabled) {
+        List<String> changed = service.setInstanceMonitoring(region, getList(p, "InstanceId"), enabled);
+        String state = enabled ? "enabled" : "disabled";
+        XmlBuilder xml = new XmlBuilder()
+                .start(action + "Response", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("instancesSet");
+        for (String id : changed) {
+            xml.start("item")
+                    .elem("instanceId", id)
+                    .start("monitoring")
+                    .elem("state", state)
+                    .end("monitoring")
+                    .end("item");
+        }
+        xml.end("instancesSet").end(action + "Response");
+        return xmlResponse(xml.build());
+    }
+
     private Response handleStartInstances(MultivaluedMap<String, String> p, String region) {
         List<String> ids = getList(p, "InstanceId");
         List<Map<String, String>> changes = service.startInstances(region, ids);
@@ -1262,6 +1303,43 @@ public class Ec2QueryHandler {
             service.modifyInstanceGroups(region, instanceId, groupIds);
         }
         return booleanResponse("ModifyInstanceAttribute");
+    }
+
+    private Response handleModifyInstanceMetadataOptions(MultivaluedMap<String, String> p, String region) {
+        String instanceId = p.getFirst("InstanceId");
+        if (instanceId == null || instanceId.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceId", 400);
+        }
+        Instance inst = service.modifyInstanceMetadataOptions(region, instanceId, parseMetadataOptions(p, ""));
+        XmlBuilder xml = new XmlBuilder()
+                .start("ModifyInstanceMetadataOptionsResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("instanceId", instanceId);
+        appendMetadataOptions(xml, "instanceMetadataOptions", inst.effectiveMetadataOptions());
+        xml.end("ModifyInstanceMetadataOptionsResponse");
+        return xmlResponse(xml.build());
+    }
+
+    /** Reads the MetadataOptions fields under {@code prefix}, leaving unspecified ones null. */
+    private LaunchTemplateData.MetadataOptions parseMetadataOptions(MultivaluedMap<String, String> p, String prefix) {
+        LaunchTemplateData.MetadataOptions options = new LaunchTemplateData.MetadataOptions();
+        options.setHttpTokens(p.getFirst(prefix + "HttpTokens"));
+        options.setHttpPutResponseHopLimit(intParam(p, prefix + "HttpPutResponseHopLimit"));
+        options.setHttpEndpoint(p.getFirst(prefix + "HttpEndpoint"));
+        options.setHttpProtocolIpv6(p.getFirst(prefix + "HttpProtocolIpv6"));
+        options.setInstanceMetadataTags(p.getFirst(prefix + "InstanceMetadataTags"));
+        return options;
+    }
+
+    private void appendMetadataOptions(XmlBuilder xml, String element, LaunchTemplateData.MetadataOptions options) {
+        xml.start(element)
+                .elem("state", options.getState() != null ? options.getState() : "applied")
+                .elem("httpTokens", options.getHttpTokens())
+                .elem("httpPutResponseHopLimit", str(options.getHttpPutResponseHopLimit()))
+                .elem("httpEndpoint", options.getHttpEndpoint())
+                .elem("httpProtocolIpv6", options.getHttpProtocolIpv6())
+                .elem("instanceMetadataTags", options.getInstanceMetadataTags())
+                .end(element);
     }
 
     // ─── VPC handlers ─────────────────────────────────────────────────────────
@@ -1417,6 +1495,7 @@ public class Ec2QueryHandler {
         if (logDestination == null) {
             logDestination = p.getFirst("LogDestinationArn");
         }
+        String deliverLogsPermissionArn = p.getFirst("DeliverLogsPermissionArn");
         String logFormat = p.getFirst("LogFormat");
         int maxAgg = parseIntParam(p, "MaxAggregationInterval", 600);
 
@@ -1434,7 +1513,7 @@ public class Ec2QueryHandler {
                 .start("flowLogIdSet");
         for (String resourceId : resourceIds) {
             FlowLog fl = flowLogService.createFlowLog(region, resourceId, resourceType, trafficType,
-                    logDestinationType, logDestination, logFormat, maxAgg);
+                    logDestinationType, logDestination, deliverLogsPermissionArn, logFormat, maxAgg);
             xml.elem("item", fl.getFlowLogId());
         }
         xml.end("flowLogIdSet")
@@ -1460,6 +1539,7 @@ public class Ec2QueryHandler {
                     .elem("trafficType", fl.getTrafficType())
                     .elem("logDestinationType", fl.getLogDestinationType())
                     .elem("logDestination", fl.getLogDestination())
+                    .elem("deliverLogsPermissionArn", fl.getDeliverLogsPermissionArn())
                     .elem("flowLogStatus", fl.getFlowLogStatus())
                     .elem("deliverLogsStatus", fl.getDeliverLogsStatus())
                     .elem("maxAggregationInterval", String.valueOf(fl.getMaxAggregationInterval()))
@@ -2134,6 +2214,18 @@ public class Ec2QueryHandler {
         return xmlResponse(xml.build());
     }
 
+    /** floci does not yet support creating Connect attachments, so this is always an empty list. */
+    private Response handleDescribeTransitGatewayConnects(MultivaluedMap<String, String> p, String region) {
+        service.describeTransitGatewayConnects(region, getList(p, "TransitGatewayAttachmentIds"), getFilters(p));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeTransitGatewayConnectsResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("transitGatewayConnectSet")
+                .end("transitGatewayConnectSet")
+                .end("DescribeTransitGatewayConnectsResponse");
+        return xmlResponse(xml.build());
+    }
+
     private Response handleModifyTransitGatewayVpcAttachment(MultivaluedMap<String, String> p, String region) {
         TransitGatewayVpcAttachment attachment = service.modifyTransitGatewayVpcAttachment(
                 region,
@@ -2585,7 +2677,7 @@ public class Ec2QueryHandler {
                 .start("cidrBlockAssociation")
                 .elem("associationId", assoc.getAssociationId())
                 .elem("cidrBlock", assoc.getCidrBlock())
-                .elem("cidrBlockState", assoc.getCidrBlockState())
+                .start("cidrBlockState").elem("state", assoc.getCidrBlockState()).end("cidrBlockState")
                 .end("cidrBlockAssociation")
                 .end("AssociateVpcCidrBlockResponse");
         return xmlResponse(xml.build());
@@ -3057,6 +3149,57 @@ public class Ec2QueryHandler {
                 .elem("requestId", UUID.randomUUID().toString())
                 .elem("imageId", image.getImageId())
                 .end("RegisterImageResponse");
+        return xmlResponse(xml.build());
+    }
+
+    /**
+     * DeregisterImage. The documented response is requestId plus {@code return} ("Returns true if
+     * the request succeeds; otherwise, it returns an error"), with deleteSnapshotResultSet present
+     * only when DeleteAssociatedSnapshots was requested.
+     *
+     * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeregisterImage.html">DeregisterImage</a>
+     */
+    private Response handleDeregisterImage(MultivaluedMap<String, String> p, String region) {
+        List<Ec2Service.SnapshotDeletion> deletions = service.deregisterImage(
+                region,
+                p.getFirst("ImageId"),
+                Boolean.parseBoolean(p.getFirst("DeleteAssociatedSnapshots")));
+        XmlBuilder xml = new XmlBuilder()
+                .start("DeregisterImageResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("return", "true");
+        if (!deletions.isEmpty()) {
+            xml.start("deleteSnapshotResultSet");
+            for (Ec2Service.SnapshotDeletion deletion : deletions) {
+                xml.start("item")
+                        .elem("snapshotId", deletion.snapshotId())
+                        .elem("returnCode", deletion.returnCode())
+                        .end("item");
+            }
+            xml.end("deleteSnapshotResultSet");
+        }
+        xml.end("DeregisterImageResponse");
+        return xmlResponse(xml.build());
+    }
+
+    /**
+     * CopyImage. "The copy operation must be initiated in the destination Region", so the
+     * request's own region is the destination and SourceRegion names where the source AMI lives.
+     *
+     * @see <a href="https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CopyImage.html">CopyImage</a>
+     */
+    private Response handleCopyImage(MultivaluedMap<String, String> p, String region) {
+        Image image = service.copyImage(
+                region,
+                p.getFirst("SourceRegion"),
+                p.getFirst("SourceImageId"),
+                p.getFirst("Name"),
+                p.getFirst("Description"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("CopyImageResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("imageId", image.getImageId())
+                .end("CopyImageResponse");
         return xmlResponse(xml.build());
     }
 
@@ -3760,11 +3903,26 @@ public class Ec2QueryHandler {
             for (String arch : (List<String>) t.get("supportedArchitectures")) {
                 xml.elem("item", arch);
             }
-            xml.end("supportedArchitectures").end("processorInfo");
+            xml.end("supportedArchitectures").end("processorInfo")
+                    .start("supportedUsageClasses");
+            for (String usageClass : (List<String>) t.get("supportedUsageClasses")) {
+                xml.elem("item", usageClass);
+            }
+            xml.end("supportedUsageClasses");
             Map<String, Object> networkInfo = (Map<String, Object>) t.get("networkInfo");
             xml.start("networkInfo")
                     .elem("encryptionInTransitSupported",
                             String.valueOf(networkInfo.get("encryptionInTransitSupported")))
+                    .elem("defaultNetworkCardIndex", (Integer) networkInfo.get("defaultNetworkCardIndex"))
+                    .elem("ipv4AddressesPerInterface", (Integer) networkInfo.get("ipv4AddressesPerInterface"))
+                    .start("networkCards");
+            for (Map<String, Object> card : (List<Map<String, Object>>) networkInfo.get("networkCards")) {
+                xml.start("item")
+                        .elem("networkCardIndex", (Integer) card.get("networkCardIndex"))
+                        .elem("maximumNetworkInterfaces", (Integer) card.get("maximumNetworkInterfaces"))
+                        .end("item");
+            }
+            xml.end("networkCards")
                     .end("networkInfo")
                     .end("item");
         }
@@ -4121,16 +4279,9 @@ public class Ec2QueryHandler {
         xml.start("cpuOptions")
                 .elem("coreCount", "1")
                 .elem("threadsPerCore", "1")
-                .end("cpuOptions")
-                .start("metadataOptions")
-                .elem("state", "applied")
-                .elem("httpTokens", "optional")
-                .elem("httpPutResponseHopLimit", "1")
-                .elem("httpEndpoint", "enabled")
-                .elem("httpProtocolIpv6", "disabled")
-                .elem("instanceMetadataTags", "disabled")
-                .end("metadataOptions")
-                .start("maintenanceOptions")
+                .end("cpuOptions");
+        appendMetadataOptions(xml, "metadataOptions", inst.effectiveMetadataOptions());
+        xml.start("maintenanceOptions")
                 .elem("autoRecovery", "default")
                 .end("maintenanceOptions")
                 .start("enclaveOptions")
@@ -4666,13 +4817,7 @@ public class Ec2QueryHandler {
         data.setTagSpecifications(parseLaunchTemplateTagSpecifications(p, prefix));
 
         if (anyParamStartsWith(p, prefix + ".MetadataOptions.")) {
-            LaunchTemplateData.MetadataOptions options = new LaunchTemplateData.MetadataOptions();
-            options.setHttpTokens(p.getFirst(prefix + ".MetadataOptions.HttpTokens"));
-            options.setHttpPutResponseHopLimit(intParam(p, prefix + ".MetadataOptions.HttpPutResponseHopLimit"));
-            options.setHttpEndpoint(p.getFirst(prefix + ".MetadataOptions.HttpEndpoint"));
-            options.setHttpProtocolIpv6(p.getFirst(prefix + ".MetadataOptions.HttpProtocolIpv6"));
-            options.setInstanceMetadataTags(p.getFirst(prefix + ".MetadataOptions.InstanceMetadataTags"));
-            data.setMetadataOptions(options);
+            data.setMetadataOptions(parseMetadataOptions(p, prefix + ".MetadataOptions."));
         }
 
         Boolean monitoringEnabled = boolParam(p, prefix + ".Monitoring.Enabled");
@@ -5282,6 +5427,25 @@ public class Ec2QueryHandler {
         }
         xml.end("spotInstanceRequestSet")
                 .end("CancelSpotInstanceRequestsResponse");
+        return xmlResponse(xml.build());
+    }
+
+    /**
+     * Return the EC2 Query response shape for spot price history.
+     *
+     * <p>Floci does not currently maintain a spot-price snapshot. AWS returns an empty
+     * {@code spotPriceHistorySet} when no matching records exist, which is sufficient for
+     * clients such as Karpenter to distinguish an empty result from an unsupported action.</p>
+     */
+    private Response handleDescribeSpotPriceHistory(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        XmlBuilder xml = new XmlBuilder()
+                .start("DescribeSpotPriceHistoryResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("nextToken", "")
+                .start("spotPriceHistorySet")
+                .end("spotPriceHistorySet")
+                .end("DescribeSpotPriceHistoryResponse");
         return xmlResponse(xml.build());
     }
 

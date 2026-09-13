@@ -2,8 +2,10 @@ package io.github.hectorvent.floci.services.redshift.proxy;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
+import io.github.hectorvent.floci.services.rds.proxy.PasswordValidator;
 import io.github.hectorvent.floci.services.rds.proxy.RdsProxyTlsCertificates;
 import io.github.hectorvent.floci.services.rds.proxy.RdsSigV4Validator;
+import io.github.hectorvent.floci.services.s3.S3Service;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -12,6 +14,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Field;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -67,8 +70,8 @@ class RedshiftAuthProxyTest {
         int proxyPort = freePort();
         proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(),
                 "admin", "Secret123", "dev",
-                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> true,
-                mock(io.github.hectorvent.floci.services.s3.S3Service.class));
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                mock(S3Service.class));
         proxy.start(proxyPort);
 
         try (Socket client = new Socket("localhost", proxyPort)) {
@@ -121,8 +124,8 @@ class RedshiftAuthProxyTest {
         int proxyPort = freePort();
         proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(),
                 "admin", "Secret123", "dev",
-                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> true,
-                mock(io.github.hectorvent.floci.services.s3.S3Service.class));
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                mock(S3Service.class));
         proxy.start(proxyPort);
 
         // Connect, then drop without ever sending a startup packet.
@@ -141,7 +144,7 @@ class RedshiftAuthProxyTest {
         // yet; free it shortly after so the retrying bind can finally take it.
         ServerSocket squatter = new ServerSocket();
         squatter.setReuseAddress(true);
-        squatter.bind(new java.net.InetSocketAddress(proxyPort));
+        squatter.bind(new InetSocketAddress(proxyPort));
         Thread.ofVirtual().start(() -> {
             try {
                 Thread.sleep(200);
@@ -152,8 +155,8 @@ class RedshiftAuthProxyTest {
 
         proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(),
                 "admin", "Secret123", "dev",
-                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> true,
-                mock(io.github.hectorvent.floci.services.s3.S3Service.class));
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                mock(S3Service.class));
         proxy.start(proxyPort); // must not throw despite the port being busy at first
 
         assertTrue(portAccepts(proxyPort), "proxy never bound the port after the squatter released it");
@@ -165,8 +168,8 @@ class RedshiftAuthProxyTest {
         int proxyPort = freePort();
         proxy = new RedshiftAuthProxy("111111111111:c1", "localhost", fakeBackend.getLocalPort(),
                 "admin", "old", "dev",
-                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> true,
-                mock(io.github.hectorvent.floci.services.s3.S3Service.class));
+                mock(RdsSigV4Validator.class), realTls(), (user, pw) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT,
+                mock(S3Service.class));
         proxy.start(proxyPort);
 
         proxy.updateMasterPassword("rotated");

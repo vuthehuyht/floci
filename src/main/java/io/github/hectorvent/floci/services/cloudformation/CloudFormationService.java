@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.cloudformation.model.Stack;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.model.TemplateSummary;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDynamicReferences;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnRollback;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.UpdateCleanupResult;
 import io.github.hectorvent.floci.services.s3.S3Service;
@@ -58,13 +59,14 @@ public class CloudFormationService implements ResourceProvider {
 
     private final ConcurrentHashMap<String, Stack> stacks = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, DeletedStackEntry> deletedStacks = new ConcurrentHashMap<>();
-    // Global exports registry: region:exportName -> exportValue
+    // Account-scoped exports registry: account:region:exportName -> exportValue
     private final ConcurrentHashMap<String, String> exports = new ConcurrentHashMap<>();
     private final ExecutorService executor = Executors.newCachedThreadPool();
 
     private final CloudFormationResourceProvisioner provisioner;
     private final S3Service s3Service;
     private final SsmService ssmService;
+    private final CfnDynamicReferences dynamicReferences;
     private final ObjectMapper objectMapper;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
@@ -73,28 +75,28 @@ public class CloudFormationService implements ResourceProvider {
     private final Clock clock;
 
     // Persisted state so stacks survive a restart (criteria #10, #11). The in-memory maps above are
-    // the live working copy; these backends are write-through + loaded on startup. CloudFormation is
-    // account-blind (keyed by stack+region), so everything is stored under one fixed account
-    // namespace for thread-consistent access from both request and background executor threads.
+    // the live working copy; these backends are write-through + loaded on startup. Legacy records
+    // without an account owner are attributed to the configured default account by the storage layer.
     private final AccountAwareStorageBackend<Stack> stackBackend;
     private final AccountAwareStorageBackend<String> exportBackend;
-    private final String storageAccount;
+
 
     @Inject
     public CloudFormationService(CloudFormationResourceProvisioner provisioner, S3Service s3Service,
-                                 SsmService ssmService, ObjectMapper objectMapper, EmulatorConfig config,
+                                 SsmService ssmService, CfnDynamicReferences dynamicReferences,
+                                 ObjectMapper objectMapper, EmulatorConfig config,
                                  RegionResolver regionResolver, Clock clock,
                                  StorageFactory storageFactory) {
         this.provisioner = provisioner;
         this.s3Service = s3Service;
         this.ssmService = ssmService;
+        this.dynamicReferences = dynamicReferences;
         this.objectMapper = objectMapper;
         this.config = config;
         this.regionResolver = regionResolver;
         this.samTransformProcessor = new SamTransformProcessor(objectMapper);
         this.awsIncludeProcessor = new AwsIncludeProcessor(objectMapper, s3Service);
         this.clock = clock;
-        this.storageAccount = config.defaultAccountId();
         this.stackBackend = storageFactory.create(
                 "cloudformation", "cloudformation-stacks.json", new TypeReference<Map<String, Stack>>() {});
         this.exportBackend = storageFactory.create(
@@ -103,12 +105,15 @@ public class CloudFormationService implements ResourceProvider {
 
     @PostConstruct
     void loadPersistedState() {
-        for (Stack stack : stackBackend.scanForAccount(storageAccount, k -> true)) {
-            stacks.put(key(stack.getStackName(), stack.getRegion()), stack);
+        for (var entry : stackBackend.scanAllAccountEntries(k -> true)) {
+            Stack stack = entry.value();
+            if (stack.getAccountId() == null) {
+                stack.setAccountId(entry.accountId());
+            }
+            stacks.put(stackKey(stack.getAccountId(), stack.getStackName(), stack.getRegion()), stack);
         }
-        for (String exportKey : exportBackend.keysForAccount(storageAccount)) {
-            exportBackend.getForAccount(storageAccount, exportKey)
-                    .ifPresent(value -> exports.put(exportKey, value));
+        for (var entry : exportBackend.scanAllAccountEntries(k -> true)) {
+            exports.put(accountExportKey(entry.accountId(), entry.key()), entry.value());
         }
         if (!stacks.isEmpty() || !exports.isEmpty()) {
             LOG.infov("Loaded {0} CloudFormation stack(s) and {1} export(s) from storage",
@@ -122,11 +127,24 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private void persistStack(Stack stack) {
-        stackBackend.putForAccount(storageAccount, key(stack.getStackName(), stack.getRegion()), stack);
+        String accountId = ownerAccount(stack);
+        stack.setAccountId(accountId);
+        stackBackend.putForAccount(accountId, stackStorageKey(stack.getStackName(), stack.getRegion()), stack);
     }
 
-    private void unpersistStack(String stackName, String region) {
-        stackBackend.deleteForAccount(storageAccount, key(stackName, region));
+    private void unpersistStack(String accountId, String stackName, String region) {
+        stackBackend.deleteForAccount(accountId, stackStorageKey(stackName, region));
+    }
+
+    private String ownerAccount(Stack stack) {
+        // Persisted stacks are assigned their storage partition's account during startup. The
+        // default is only a compatibility attribution for transient ownerless fixtures created
+        // directly by callers of the service.
+        return stack.getAccountId() != null ? stack.getAccountId() : config.defaultAccountId();
+    }
+
+    private String currentAccount() {
+        return regionResolver.getAccountId();
     }
 
     /**
@@ -143,8 +161,12 @@ public class CloudFormationService implements ResourceProvider {
     // ── DescribeStacks ────────────────────────────────────────────────────────
 
     public List<Stack> describeStacks(String stackName, String region) {
+        return describeStacks(stackName, region, currentAccount());
+    }
+
+    public List<Stack> describeStacks(String stackName, String region, String accountId) {
         if (stackName != null && !stackName.isBlank()) {
-            Stack stack = resolveStackForDescribe(stackName, region);
+            Stack stack = resolveStackForDescribe(stackName, region, accountId);
             if (stack == null) {
                 throw new AwsException("ValidationError",
                         "Stack with id " + stackName + " does not exist", 400);
@@ -152,7 +174,7 @@ public class CloudFormationService implements ResourceProvider {
             return List.of(stack);
         }
         return stacks.values().stream()
-                .filter(s -> region.equals(s.getRegion()))
+                .filter(s -> accountId.equals(ownerAccount(s)) && region.equals(s.getRegion()))
                 .sorted(Comparator.comparing(Stack::getCreationTime))
                 .toList();
     }
@@ -173,7 +195,11 @@ public class CloudFormationService implements ResourceProvider {
      * StackSet deployment uses this to decide what to do with an instance before it acts on it.
      */
     String stackStatus(String stackName, String region) {
-        Stack stack = resolveStack(stackName, region);
+        return stackStatus(stackName, region, currentAccount());
+    }
+
+    String stackStatus(String stackName, String region, String accountId) {
+        Stack stack = resolveStack(stackName, region, accountId);
         return stack != null ? stack.getStatus() : null;
     }
 
@@ -304,10 +330,14 @@ public class CloudFormationService implements ResourceProvider {
         // remapping function does short, non-blocking work.
         boolean isCreateType = changeSetType == null || "CREATE".equalsIgnoreCase(changeSetType);
         ChangeSet[] created = new ChangeSet[1];
-        Stack stack = stacks.compute(key(stackName, region), (k, existing) -> {
+        Stack stack = stacks.compute(stackKey(accountId, stackName, region), (k, existing) -> {
             Stack target;
             if (existing == null) {
-                target = newStack(stackName, region);
+                if (!isCreateType) {
+                    throw new AwsException("ValidationError",
+                            "Stack with id " + stackName + " does not exist", 400);
+                }
+                target = newStack(stackName, region, accountId);
                 if (tags != null) target.getTags().putAll(tags);
                 // A CREATE change set puts a brand-new stack into REVIEW_IN_PROGRESS. Record the
                 // matching stack-level event (as AWS and LocalStack do) so DescribeStackEvents is
@@ -337,7 +367,7 @@ public class CloudFormationService implements ResourceProvider {
             }
 
             ChangeSet cs = new ChangeSet();
-            cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, regionResolver.getAccountId(), "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
+            cs.setChangeSetId(AwsArnUtils.Arn.of("cloudformation", region, accountId, "changeSet/" + changeSetName + "/" + UUID.randomUUID()).toString());
             cs.setChangeSetName(changeSetName);
             cs.setStackName(stackName);
             cs.setStackId(target.getStackId());
@@ -406,7 +436,8 @@ public class CloudFormationService implements ResourceProvider {
 
     public ChangeSet describeChangeSet(String stackName, String changeSetName, String region) {
         Stack stack = getStackOrThrow(stackName, region);
-        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
+        ChangeSet cs = stack.getChangeSets().get(
+                resolveChangeSetName(changeSetName, region, currentAccount()));
         if (cs == null) {
             throw new AwsException("ChangeSetNotFoundException",
                     "ChangeSet [" + changeSetName + "] does not exist", 400);
@@ -589,8 +620,9 @@ public class CloudFormationService implements ResourceProvider {
      * that failure surfaces on those paths, and floci must still expose it there.
      */
     public Future<?> executeChangeSetForRequest(String stackName, String changeSetName, String region) {
-        Stack stack = getStackOrThrow(stackName, region);
-        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
+        Stack stack = getStackOrThrow(stackName, region, regionResolver.getAccountId());
+        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(
+                changeSetName, region, regionResolver.getAccountId()));
         if (cs == null) {
             throw new AwsException("ChangeSetNotFoundException",
                     "ChangeSet [" + changeSetName + "] does not exist", 400);
@@ -617,8 +649,8 @@ public class CloudFormationService implements ResourceProvider {
      * when that change set failed, for example from a failed SAM transform.
      */
     public Future<?> executeChangeSet(String stackName, String changeSetName, String region, String accountId) {
-        Stack stack = getStackOrThrow(stackName, region);
-        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName));
+        Stack stack = getStackOrThrow(stackName, region, accountId);
+        ChangeSet cs = stack.getChangeSets().get(resolveChangeSetName(changeSetName, region, accountId));
         if (cs == null) {
             throw new AwsException("ChangeSetNotFoundException",
                     "ChangeSet [" + changeSetName + "] does not exist", 400);
@@ -674,7 +706,7 @@ public class CloudFormationService implements ResourceProvider {
 
     public void deleteChangeSet(String stackName, String changeSetName, String region) {
         Stack stack = getStackOrThrow(stackName, region);
-        String name = resolveChangeSetName(changeSetName);
+        String name = resolveChangeSetName(changeSetName, region, currentAccount());
         ChangeSet cs = stack.getChangeSets().get(name);
         if (cs == null) {
             throw new AwsException("ChangeSetNotFoundException",
@@ -701,8 +733,20 @@ public class CloudFormationService implements ResourceProvider {
      */
     public Future<?> deleteStack(String stackName, String region, String accountId) {
         purgeExpiredDeletedStacks();
-        Stack stack = resolveStack(stackName, region);
+        Stack stack = resolveStack(stackName, region, accountId);
         if (stack == null) {
+            if (stackName != null && stackName.startsWith("arn:")) {
+                try {
+                    AwsArnUtils.Arn arn = AwsArnUtils.parse(stackName);
+                    if (!accountId.equals(arn.accountId()) || !region.equals(arn.region())) {
+                        throw new AwsException("ValidationError",
+                                "Stack with id " + stackName + " does not exist", 400);
+                    }
+                } catch (IllegalArgumentException e) {
+                    throw new AwsException("ValidationError",
+                            "Stack with id " + stackName + " does not exist", 400);
+                }
+            }
             return CompletableFuture.completedFuture(null); // Already gone — no-op
         }
         if (stack.isEnableTerminationProtection()) {
@@ -913,8 +957,9 @@ public class CloudFormationService implements ResourceProvider {
     // ── ListStacks ────────────────────────────────────────────────────────────
 
     public List<Stack> listStacks(String region) {
+        String accountId = currentAccount();
         return stacks.values().stream()
-                .filter(s -> region.equals(s.getRegion()))
+                .filter(s -> accountId.equals(ownerAccount(s)) && region.equals(s.getRegion()))
                 .sorted(Comparator.comparing(Stack::getCreationTime))
                 .toList();
     }
@@ -923,8 +968,9 @@ public class CloudFormationService implements ResourceProvider {
 
     public Map<String, ExportEntry> listExports(String region) {
         Map<String, ExportEntry> result = new LinkedHashMap<>();
+        String accountId = currentAccount();
         for (Stack stack : stacks.values()) {
-            if (!region.equals(stack.getRegion())) {
+            if (!accountId.equals(ownerAccount(stack)) || !region.equals(stack.getRegion())) {
                 continue;
             }
             for (var entry : stack.getExports().entrySet()) {
@@ -939,16 +985,21 @@ public class CloudFormationService implements ResourceProvider {
     // ── Private ───────────────────────────────────────────────────────────────
 
     private void removeStackExports(Stack stack, String region) {
+        String accountId = ownerAccount(stack);
         for (String exportName : stack.getExports().keySet()) {
-            String exportKey = exportKey(region, exportName);
-            exports.remove(exportKey);
-            exportBackend.deleteForAccount(storageAccount, exportKey);
+            String logicalKey = exportKey(region, exportName);
+            exports.remove(accountExportKey(accountId, logicalKey));
+            exportBackend.deleteForAccount(accountId, logicalKey);
         }
     }
 
     private String exportKey(String region, String exportName) {
         return region + ":" + exportName;
     }
+    private String accountExportKey(String accountId, String logicalKey) {
+        return accountId + ":" + logicalKey;
+    }
+
 
     private void validateExportNameAvailable(String region, String exportName,
                                              Map<String, String> oldExports,
@@ -957,7 +1008,7 @@ public class CloudFormationService implements ResourceProvider {
             throw new AwsException("ValidationError",
                     "Export with name " + exportName + " is already defined by this stack", 400);
         }
-        if (!oldExports.containsKey(exportName) && exports.containsKey(exportKey(region, exportName))) {
+        if (!oldExports.containsKey(exportName) && exports.containsKey(accountExportKey(currentAccount(), region + ":" + exportName))) {
             throw new AwsException("ValidationError",
                     "Export with name " + exportName + " is already exported by another stack", 400);
         }
@@ -1088,7 +1139,8 @@ public class CloudFormationService implements ResourceProvider {
                     CloudFormationTemplateEngine engine = new CloudFormationTemplateEngine(
                             accountId, region, stack.getStackName(),
                             stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
-                            name -> exports.get(exportKey(region, name)));
+                            name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
+                            value -> dynamicReferences.resolveDynamicReferences(value, region, false));
 
                     StackResource resource = stack.getResources().get(logicalId);
                     StackResource previousResource = resource;
@@ -1186,7 +1238,8 @@ public class CloudFormationService implements ResourceProvider {
             CloudFormationTemplateEngine finalEngine = new CloudFormationTemplateEngine(
                     accountId, region, stack.getStackName(),
                     stack.getStackId(), resolvedParams, physicalIds, resourceAttrs, conditions, mappings, objectMapper,
-                    name -> exports.get(exportKey(region, name)));
+                    name -> exports.get(accountExportKey(accountId, exportKey(region, name))),
+                    value -> dynamicReferences.resolveDynamicReferences(value, region, false));
 
             // Resolve outputs before mutating stack/global export state, so failed updates do not
             // leave stale or partially registered exports behind.
@@ -1220,9 +1273,10 @@ public class CloudFormationService implements ResourceProvider {
             stack.getOutputExportNames().clear();
             stack.getOutputExportNames().putAll(newOutputExportNames);
             newExports.forEach((exportName, value) -> {
-                String exportKey = exportKey(region, exportName);
+                String logicalKey = region + ":" + exportName;
+                String exportKey = accountExportKey(accountId, logicalKey);
                 exports.put(exportKey, value);
-                exportBackend.putForAccount(storageAccount, exportKey, value);
+                exportBackend.putForAccount(accountId, logicalKey, value);
                 LOG.infov("Registered export {0} = {1} from stack {2}",
                         exportName, value, stack.getStackName());
             });
@@ -1243,7 +1297,7 @@ public class CloudFormationService implements ResourceProvider {
                 List<UpdateCleanupFailure> cleanupFailures =
                         new ArrayList<>(deleteRemovedOrConditionFalseResources(
                                 stack, resources, conditions, region));
-                cleanupFailures.addAll(finishCommittedResourceCleanup(stack));
+                cleanupFailures.addAll(finishCommittedResourceCleanup(stack, region));
                 finishCommittedStackUpdate(stack, cleanupFailures);
                 return;
             }
@@ -1334,9 +1388,16 @@ public class CloudFormationService implements ResourceProvider {
         persistStack(stack);
     }
 
-    private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack) {
+    private List<UpdateCleanupFailure> finishCommittedResourceCleanup(Stack stack, String region) {
         List<UpdateCleanupFailure> failures = new ArrayList<>();
-        for (StackResource resource : stack.getResources().values()) {
+        // Dependents go before what they depend on, as when the stack is deleted: a displaced
+        // listener has to go before the displaced target group it still forwards to, or that
+        // delete fails ResourceInUse three times and leaves the group behind. The template's
+        // order, not the map's: a resource a later update added sits after the resources that
+        // depend on it, so reversing the map would delete it first.
+        List<StackResource> resources = resourcesInCreationOrder(stack, region);
+        Collections.reverse(resources);
+        for (StackResource resource : resources) {
             String cleanupPhysicalId = provisioner.updateCleanupPhysicalId(resource);
             if (cleanupPhysicalId != null) {
                 addEvent(
@@ -1589,10 +1650,11 @@ public class CloudFormationService implements ResourceProvider {
             Stack stack, String region, StackUpdateSnapshot previousState) {
         RuntimeException storageFailure = null;
         for (String exportName : new ArrayList<>(stack.getExports().keySet())) {
-            String key = exportKey(region, exportName);
+            String logicalKey = exportKey(region, exportName);
+            String key = accountExportKey(ownerAccount(stack), logicalKey);
             exports.remove(key);
             try {
-                exportBackend.deleteForAccount(storageAccount, key);
+                exportBackend.deleteForAccount(ownerAccount(stack), logicalKey);
             } catch (RuntimeException e) {
                 storageFailure = appendFailure(storageFailure, e);
             }
@@ -1606,10 +1668,11 @@ public class CloudFormationService implements ResourceProvider {
         stack.getOutputExportNames().putAll(previousState.outputExportNames());
 
         for (Map.Entry<String, String> entry : previousState.exports().entrySet()) {
-            String key = exportKey(region, entry.getKey());
+            String logicalKey = exportKey(region, entry.getKey());
+            String key = accountExportKey(ownerAccount(stack), logicalKey);
             exports.put(key, entry.getValue());
             try {
-                exportBackend.putForAccount(storageAccount, key, entry.getValue());
+                exportBackend.putForAccount(ownerAccount(stack), logicalKey, entry.getValue());
             } catch (RuntimeException e) {
                 storageFailure = appendFailure(storageFailure, e);
             }
@@ -1822,7 +1885,7 @@ public class CloudFormationService implements ResourceProvider {
             // last update left in place. An entity displaced by a replacement whose cleanup phase
             // never ended is named only by the cleanup the resource still carries, so the stack
             // deletes that one too: nothing else ever will.
-            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack)) {
+            for (UpdateCleanupFailure displacedFailure : finishCommittedResourceCleanup(stack, region)) {
                 failedResources.add(displacedFailure.logicalId());
             }
             for (StackResource resource : resources) {
@@ -1881,8 +1944,8 @@ public class CloudFormationService implements ResourceProvider {
             addEvent(stack, stack.getStackName(), stack.getStackId(),
                     "AWS::CloudFormation::Stack", "DELETE_COMPLETE", null);
             removeStackExports(stack, region);
-            stacks.remove(key(stack.getStackName(), region));
-            unpersistStack(stack.getStackName(), region);
+            stacks.remove(stackKey(ownerAccount(stack), stack.getStackName(), region));
+            unpersistStack(ownerAccount(stack), stack.getStackName(), region);
             deletedStacks.put(stack.getStackId(), new DeletedStackEntry(
                     stack,
                     now().plusSeconds(config.services().cloudformation().deletedStackRetentionSeconds())));
@@ -2175,9 +2238,9 @@ public class CloudFormationService implements ResourceProvider {
         String childTemplate = fetchTemplateFromS3(templateUrl);
         String childStackName = parentStack.getStackName() + "-" + logicalId;
 
-        Stack childStack = newStack(childStackName, region);
+        Stack childStack = newStack(childStackName, region, accountId);
         childStack.setStatus("CREATE_IN_PROGRESS");
-        stacks.put(key(childStackName, region), childStack);
+        stacks.put(stackKey(accountId, childStackName, region), childStack);
 
         Map<String, String> childParams = new LinkedHashMap<>();
         if (props != null && props.has("Parameters") && props.get("Parameters").isObject()) {
@@ -2201,12 +2264,14 @@ public class CloudFormationService implements ResourceProvider {
         return resource;
     }
 
-    private Stack newStack(String stackName, String region) {
+
+    private Stack newStack(String stackName, String region, String accountId) {
         Stack stack = new Stack();
         stack.setStackName(stackName);
         stack.setRegion(region);
+        stack.setAccountId(accountId);
         stack.setStatus("REVIEW_IN_PROGRESS");
-        String stackId = AwsArnUtils.Arn.of("cloudformation", region, regionResolver.getAccountId(), "stack/" + stackName + "/" + UUID.randomUUID()).toString();
+        String stackId = AwsArnUtils.Arn.of("cloudformation", region, accountId, "stack/" + stackName + "/" + UUID.randomUUID()).toString();
         stack.setStackId(stackId);
         stack.setCreationTime(now());
         return stack;
@@ -2226,7 +2291,11 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private Stack getStackOrThrow(String stackNameOrArn, String region) {
-        Stack stack = resolveStack(stackNameOrArn, region);
+        return getStackOrThrow(stackNameOrArn, region, currentAccount());
+    }
+
+    private Stack getStackOrThrow(String stackNameOrArn, String region, String accountId) {
+        Stack stack = resolveStack(stackNameOrArn, region, accountId);
         if (stack == null) {
             throw new AwsException("ValidationError",
                     "Stack with id " + stackNameOrArn + " does not exist", 400);
@@ -2235,7 +2304,11 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private Stack resolveStackForDescribe(String stackNameOrArn, String region) {
-        Stack stack = resolveStack(stackNameOrArn, region);
+        return resolveStackForDescribe(stackNameOrArn, region, currentAccount());
+    }
+
+    private Stack resolveStackForDescribe(String stackNameOrArn, String region, String accountId) {
+        Stack stack = resolveStack(stackNameOrArn, region, accountId);
         if (stack != null) {
             return stack;
         }
@@ -2246,7 +2319,8 @@ public class CloudFormationService implements ResourceProvider {
                     deletedStacks.remove(stackNameOrArn, deleted);
                     return null;
                 }
-                if (region.equals(deleted.stack().getRegion())) {
+                if (accountId.equals(ownerAccount(deleted.stack()))
+                        && region.equals(deleted.stack().getRegion())) {
                     return deleted.stack();
                 }
             }
@@ -2274,20 +2348,27 @@ public class CloudFormationService implements ResourceProvider {
      * The AWS CLI passes the full ARN (arn:aws:cloudformation:…:changeSet/<name>/<uuid>)
      * when referencing a changeset by the ID returned from CreateChangeSet.
      */
-    private String resolveChangeSetName(String changeSetNameOrArn) {
-        if (changeSetNameOrArn != null && changeSetNameOrArn.startsWith("arn:")) {
-            // arn:aws:cloudformation:<region>:<account>:changeSet/<name>/<uuid>
-            try {
-                String resource = AwsArnUtils.parse(changeSetNameOrArn).resource();
-                String[] parts = resource.split("/");
-                if (parts.length >= 2) {
-                    return parts[1];
-                }
-            } catch (IllegalArgumentException e) {
-                // fall through to return as-is
-            }
+    private String resolveChangeSetName(String changeSetNameOrArn, String region, String accountId) {
+        if (changeSetNameOrArn == null || !changeSetNameOrArn.startsWith("arn:")) {
+            return changeSetNameOrArn;
         }
-        return changeSetNameOrArn;
+        try {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(changeSetNameOrArn);
+            if (!accountId.equals(arn.accountId()) || !region.equals(arn.region())) {
+                throw new AwsException("ValidationError",
+                        "Change set " + changeSetNameOrArn + " does not belong to this account or region", 400);
+            }
+            String resource = arn.resource();
+            String[] parts = resource.split("/");
+            if (parts.length >= 2 && "changeSet".equals(parts[0])) {
+                return parts[1];
+            }
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("ValidationError",
+                    "Invalid change set ARN: " + changeSetNameOrArn, 400);
+        }
+        throw new AwsException("ValidationError",
+                "Invalid change set ARN: " + changeSetNameOrArn, 400);
     }
 
     /**
@@ -2296,24 +2377,36 @@ public class CloudFormationService implements ResourceProvider {
      * Falls back to a linear scan matching on stackId for robustness.
      */
     private Stack resolveStack(String stackNameOrArn, String region) {
+        return resolveStack(stackNameOrArn, region, currentAccount());
+    }
+
+    private Stack resolveStack(String stackNameOrArn, String region, String accountId) {
         // Try direct name lookup first (fast path)
-        Stack stack = stacks.get(key(stackNameOrArn, region));
+        Stack stack = stacks.get(stackKey(accountId, stackNameOrArn, region));
         if (stack != null) {
             return stack;
         }
 
         // If input looks like an ARN, extract the stack name and retry
         if (stackNameOrArn != null && stackNameOrArn.startsWith("arn:")) {
+            try {
+                AwsArnUtils.Arn arn = AwsArnUtils.parse(stackNameOrArn);
+                if (!accountId.equals(arn.accountId()) || !region.equals(arn.region())) {
+                    return null;
+                }
+            } catch (IllegalArgumentException e) {
+                return null;
+            }
             String extractedName = extractStackNameFromArn(stackNameOrArn);
             if (extractedName != null) {
-                stack = stacks.get(key(extractedName, region));
+                stack = stacks.get(stackKey(accountId, extractedName, region));
                 if (stack != null) {
                     return stack;
                 }
             }
             // Fallback: scan by stackId in case the ARN format is unexpected
             for (Stack s : stacks.values()) {
-                if (stackNameOrArn.equals(s.getStackId())) {
+                if (accountId.equals(ownerAccount(s)) && stackNameOrArn.equals(s.getStackId())) {
                     return s;
                 }
             }
@@ -2533,8 +2626,12 @@ public class CloudFormationService implements ResourceProvider {
         }
     }
 
-    private static String key(String stackName, String region) {
+    private static String stackStorageKey(String stackName, String region) {
         return region + ":" + stackName;
+    }
+
+    private static String stackKey(String accountId, String stackName, String region) {
+        return accountId + ":" + region + ":" + stackName;
     }
 
     // ─── Resource Explorer 2 ───────────────────────────────────────────────────

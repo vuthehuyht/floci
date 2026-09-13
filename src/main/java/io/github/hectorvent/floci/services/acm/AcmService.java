@@ -46,6 +46,9 @@ public class AcmService implements ResourceProvider {
     private static final int MAX_TAG_VALUE_LENGTH = 256;
     private static final int MAX_SANS = 100;
     private static final int MAX_DOMAIN_LENGTH = 253;
+    /** Key algorithms real ACM accepts for RequestCertificate; the wider enum stays valid for ImportCertificate. */
+    private static final Set<KeyAlgorithm> REQUESTABLE_KEY_ALGORITHMS =
+        EnumSet.of(KeyAlgorithm.RSA_2048, KeyAlgorithm.EC_prime256v1, KeyAlgorithm.EC_secp384r1);
     private final StorageBackend<String, Certificate> store;
     private final CertificateGenerator certificateGenerator;
     private final FlociCertificateAuthority certificateAuthority;
@@ -105,14 +108,30 @@ public class AcmService implements ResourceProvider {
                                           String idempotencyToken, KeyAlgorithm keyAlgorithm,
                                           String certAuthorityArn, CertificateOptions options,
                                           Map<String, String> tags, String region) {
+        return requestCertificate(domainName, sans, validationMethod, idempotencyToken, keyAlgorithm,
+            certAuthorityArn, options, tags, Map.of(), region);
+    }
+
+    /**
+     * @param validationDomains the {@code ValidationDomain} of each requested {@code DomainValidationOptions}
+     *                          entry, keyed by its {@code DomainName}. Domains absent from the map validate
+     *                          against themselves, which is what AWS reports when the caller supplies nothing.
+     */
+    public Certificate requestCertificate(String domainName, List<String> sans, ValidationMethod validationMethod,
+                                          String idempotencyToken, KeyAlgorithm keyAlgorithm,
+                                          String certAuthorityArn, CertificateOptions options,
+                                          Map<String, String> tags, Map<String, String> validationDomains,
+                                          String region) {
         logSecurityWarningOnce();
         validateDomainName(domainName);
         validateSans(sans);
+        Map<String, String> requestedValidationDomains = indexValidationDomains(validationDomains, domainName, sans);
         if (tags != null) {
             validateTags(tags);
         }
 
         KeyAlgorithm alg = keyAlgorithm != null ? keyAlgorithm : KeyAlgorithm.RSA_2048;
+        validateRequestableKeyAlgorithm(alg, region);
 
         // Check idempotency with parameter validation
         if (idempotencyToken != null && !idempotencyToken.isEmpty()) {
@@ -137,6 +156,8 @@ public class AcmService implements ResourceProvider {
             status = validationWaitSeconds > 0 ? CertificateStatus.PENDING_VALIDATION : CertificateStatus.ISSUED;
         }
 
+        ValidationMethod method = validationMethod != null ? validationMethod : ValidationMethod.DNS;
+
         // A server leaf signed by the local CA, so Certificate plus CertificateChain from
         // GetCertificate validate the way an ACM certificate and its chain do on AWS.
         CertificateGenerator.GeneratedCertificate generated = certificateAuthority.issueServerCertificate(
@@ -158,7 +179,7 @@ public class AcmService implements ResourceProvider {
 
         cert.setStatus(status);
         cert.setType(type);
-        cert.setValidationMethod(validationMethod != null ? validationMethod : ValidationMethod.DNS);
+        cert.setValidationMethod(method);
         cert.setCreatedAt(now);
         cert.setIssuedAt(status == CertificateStatus.ISSUED ? now : null);
         cert.setNotBefore(generated.notBefore());
@@ -176,10 +197,10 @@ public class AcmService implements ResourceProvider {
         cert.setIdempotencyToken(idempotencyToken);
         cert.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
 
-        // Generate domain validation options with correct status based on type
         List<DomainValidation> validations = new ArrayList<>();
         for (String san : allSans) {
-            validations.add(generateDomainValidation(san, validationMethod, type));
+            validations.add(generateDomainValidation(san, requestedValidationDomains.get(san.toLowerCase(Locale.ROOT)),
+                method, status));
         }
         cert.setDomainValidationOptions(validations);
 
@@ -236,6 +257,7 @@ public class AcmService implements ResourceProvider {
 
         List<Certificate> allCerts = store.scan(k -> true).stream()
             .filter(c -> c.getArn().contains(":acm:" + region + ":"))
+            .map(c -> settleValidation(c, region))
             .filter(c -> statuses == null || statuses.isEmpty() || statuses.contains(c.getStatus()))
             .filter(c -> keyTypes == null || keyTypes.isEmpty() || keyTypes.contains(c.getKeyAlgorithm()))
             .sorted(Comparator.comparing(Certificate::getArn))
@@ -572,9 +594,42 @@ public class AcmService implements ResourceProvider {
         String certId = extractCertificateIdFromArn(arn);
         String storageKey = regionKey(region, certId);
 
-        return store.get(storageKey).orElseThrow(() ->
+        Certificate cert = store.get(storageKey).orElseThrow(() ->
             new AwsException("ResourceNotFoundException",
                 "The certificate " + arn + " does not exist.", 404));
+        return settleValidation(cert, region);
+    }
+
+    /**
+     * Brings a stored certificate in line on read. A PENDING_VALIDATION certificate whose configured
+     * validation wait has passed is issued, since nothing else moves it along; and a certificate
+     * that has been issued (status ISSUED, or IssuedAt set on one revoked or expired since) reports
+     * SUCCESS for every domain, which also repairs records stored by earlier releases as ISSUED
+     * with pending entries. A certificate revoked before it was ever issued keeps its pending
+     * entries. Changes are stored, which is what a client polling ACM observes.
+     */
+    private Certificate settleValidation(Certificate cert, String region) {
+        boolean changed = false;
+        if (cert.getStatus() == CertificateStatus.PENDING_VALIDATION && cert.getCreatedAt() != null
+                && !Instant.now().isBefore(cert.getCreatedAt().plusSeconds(validationWaitSeconds))) {
+            cert.setStatus(CertificateStatus.ISSUED);
+            cert.setIssuedAt(Instant.now());
+            LOG.debugv("Certificate {0} issued after the validation wait", cert.getArn());
+            changed = true;
+        }
+        boolean issued = cert.getStatus() == CertificateStatus.ISSUED || cert.getIssuedAt() != null;
+        if (issued && !cert.getDomainValidationOptions().stream()
+                .allMatch(validation -> "SUCCESS".equals(validation.validationStatus()))) {
+            cert.setDomainValidationOptions(cert.getDomainValidationOptions().stream()
+                .map(validation -> new DomainValidation(validation.domainName(), validation.validationDomain(),
+                    "SUCCESS", validation.validationMethod(), validation.resourceRecord(), validation.validationEmails()))
+                .toList());
+            changed = true;
+        }
+        if (changed) {
+            store.put(regionKey(region, cert.extractCertificateId()), cert);
+        }
+        return cert;
     }
 
     /**
@@ -637,6 +692,16 @@ public class AcmService implements ResourceProvider {
         }
     }
 
+    private void validateRequestableKeyAlgorithm(KeyAlgorithm alg, String region) {
+        if (REQUESTABLE_KEY_ALGORITHMS.contains(alg)) {
+            return;
+        }
+        // Real ACM quirk: the RSA_4096 message carries the account id where the region goes.
+        String location = alg == KeyAlgorithm.RSA_4096 ? regionResolver.getAccountId() : region;
+        throw new AwsException("ValidationException",
+            "Encryption Algorithm " + alg.name() + " is not supported in " + location + " region", 400);
+    }
+
     private void validateSans(List<String> sans) {
         if (sans != null && sans.size() > MAX_SANS) {
             throw new AwsException("ValidationException",
@@ -673,30 +738,88 @@ public class AcmService implements ResourceProvider {
     }
 
     /**
-     * Generates domain validation options with status based on certificate type.
-     * Private certificates have SUCCESS status immediately; public certificates
-     * start with PENDING_VALIDATION until DNS/email validation completes.
+     * Indexes the {@code ValidationDomain} of each requested {@code DomainValidationOptions} entry by a
+     * lowercased {@code DomainName}, rejecting the entries AWS rejects: a {@code DomainName} that is not
+     * part of the request, and a {@code ValidationDomain} that is neither the domain itself nor one of
+     * its superdomains.
      */
-    private DomainValidation generateDomainValidation(String domain, ValidationMethod method, CertificateType type) {
+    private Map<String, String> indexValidationDomains(Map<String, String> validationDomains,
+                                                       String domainName, List<String> sans) {
+        if (validationDomains == null || validationDomains.isEmpty()) {
+            return Map.of();
+        }
+        Set<String> requested = new HashSet<>();
+        requested.add(domainName.toLowerCase(Locale.ROOT));
+        if (sans != null) {
+            sans.forEach(san -> requested.add(san.toLowerCase(Locale.ROOT)));
+        }
+        Map<String, String> indexed = new HashMap<>();
+        validationDomains.forEach((domain, validationDomain) -> {
+            String key = domain.toLowerCase(Locale.ROOT);
+            if (!requested.contains(key) || !isValidationDomainOf(domain, validationDomain)) {
+                throw new AwsException("InvalidDomainValidationOptionsException",
+                    "One or more values in the DomainValidationOption structure is incorrect.", 400);
+            }
+            indexed.put(key, validationDomain);
+        });
+        return indexed;
+    }
+
+    /**
+     * A {@code ValidationDomain} is only usable for a domain when it is that domain or one of its
+     * superdomains: it is the suffix of the mailboxes ACM will accept an approval from.
+     */
+    static boolean isValidationDomainOf(String domain, String validationDomain) {
+        String lowerDomain = domain.toLowerCase(Locale.ROOT);
+        String lowerValidationDomain = validationDomain.toLowerCase(Locale.ROOT);
+        return lowerDomain.equals(lowerValidationDomain) || lowerDomain.endsWith("." + lowerValidationDomain);
+    }
+
+    /**
+     * Generates a domain validation entry whose status follows the certificate: an ISSUED
+     * certificate has validated every domain, a PENDING_VALIDATION one has not yet.
+     *
+     * <p>The artefacts follow the validation method, as on AWS: DNS validation carries the CNAME
+     * record to publish under {@code _<token>.<domain>}, EMAIL validation carries instead the
+     * addresses the approval mail went to, the five conventional mailboxes of the validation
+     * domain. Real ACM also mails the WHOIS contacts, which the emulator cannot know.</p>
+     *
+     * @param requestedValidationDomain the {@code ValidationDomain} the caller asked for, or {@code null}
+     *                                  to validate the domain against itself (a wildcard against its base
+     *                                  domain for EMAIL, since there is no mailbox at {@code *.})
+     */
+    private DomainValidation generateDomainValidation(String domain, String requestedValidationDomain,
+                                                      ValidationMethod method, CertificateStatus status) {
+        String validationStatus = status == CertificateStatus.ISSUED ? "SUCCESS" : "PENDING_VALIDATION";
+
+        if (method == ValidationMethod.EMAIL) {
+            String validationDomain = requestedValidationDomain != null ? requestedValidationDomain : baseDomain(domain);
+            return new DomainValidation(domain, validationDomain, validationStatus, method.name(), null,
+                validationEmails(validationDomain));
+        }
+
         String validationToken = generateValidationToken(domain);
-        String validationDomain = baseDomain(domain);
+        String recordBase = baseDomain(domain);
         ResourceRecord resourceRecord = new ResourceRecord(
-            "_" + validationToken.substring(0, 32) + "." + validationDomain + ".",
+            "_" + validationToken.substring(0, 32) + "." + recordBase + ".",
             "CNAME",
             "_" + validationToken.substring(32) + ".acm-validations.aws."
         );
-
-        // Private certificates don't need validation; public certificates do
-        String validationStatus = (type == CertificateType.PRIVATE) ? "SUCCESS" : "PENDING_VALIDATION";
-
         return new DomainValidation(
             domain,
-            domain,
+            requestedValidationDomain != null ? requestedValidationDomain : domain,
             validationStatus,
-            method != null ? method.name() : "DNS",
+            method.name(),
             resourceRecord,
             null
         );
+    }
+
+    /** The mailboxes ACM always sends the approval mail to, in the order the console lists them. */
+    static List<String> validationEmails(String validationDomain) {
+        String domain = validationDomain.toLowerCase(Locale.ROOT);
+        return List.of("admin@" + domain, "administrator@" + domain, "hostmaster@" + domain,
+            "postmaster@" + domain, "webmaster@" + domain);
     }
 
     private String generateValidationToken(String domain) {

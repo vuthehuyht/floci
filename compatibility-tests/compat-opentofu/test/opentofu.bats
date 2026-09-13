@@ -148,6 +148,13 @@ sha256_composite_by_sizes() {
     assert_output --partial "floci-compat-events"
 }
 
+@test "OpenTofu: SES receipt filter created" {
+    run aws_cmd ses list-receipt-filters
+    assert_success
+    assert_output --partial "floci-compat-filter"
+    assert_output --partial "10.10.10.0/24"
+}
+
 @test "OpenTofu: SES receipt rule set created and active" {
     run aws_cmd ses describe-receipt-rule-set --rule-set-name floci-compat-rule-set
     assert_success
@@ -156,6 +163,15 @@ sha256_composite_by_sizes() {
     run aws_cmd ses describe-active-receipt-rule-set
     assert_success
     assert_output --partial "floci-compat-rule-set"
+    assert_output --partial "X-Floci-Compat"
+}
+
+@test "OpenTofu: SES receipt rule round-trips its actions" {
+    run aws_cmd ses describe-receipt-rule --rule-set-name floci-compat-rule-set --rule-name floci-compat-rule
+    assert_success
+    assert_output --partial "X-Floci-Compat"
+    assert_output --partial "floci-compat-events"
+    assert_output --partial "RuleSet"
 }
 
 @test "OpenTofu: DynamoDB table created" {
@@ -426,4 +442,42 @@ sha256_composite_by_sizes() {
         --query "AutoEnableOrganizationMembers" --output text
     assert_success
     assert_output "ALL"
+}
+
+@test "OpenTofu: Transfer Family server created and ONLINE" {
+    run aws_cmd transfer list-servers --query "Servers[0].State" --output text
+    assert_success
+    assert_output "ONLINE"
+}
+
+@test "OpenTofu: CloudTrail trail created, logging and tagged" {
+    run aws_cmd cloudtrail describe-trails --trail-name-list floci-compat-trail \
+        --query "trailList[0].S3BucketName" --output text
+    assert_success
+    assert_output "floci-compat-trail-logs"
+    run aws_cmd cloudtrail get-trail-status --name floci-compat-trail \
+        --query "IsLogging" --output text
+    assert_success
+    assert_output "True"
+    run aws_cmd cloudtrail describe-trails --trail-name-list floci-compat-trail \
+        --query "trailList[0].TrailARN" --output text
+    assert_success
+    TRAIL_ARN="$output"
+    run aws_cmd cloudtrail list-tags --resource-id-list "$TRAIL_ARN" \
+        --query "ResourceTagList[0].TagsList[?Key=='Environment'].Value" --output text
+    assert_success
+    assert_output "compat-test"
+}
+
+# The tag refresh path (issue #2800): a re-plan reads the trail back, including its
+# tags via ListTags, and must not report drift.
+@test "OpenTofu: re-planning CloudTrail reports no changes" {
+    cd "$TOFU_DIR"
+    run tofu plan -var="endpoint=${FLOCI_ENDPOINT}" -input=false -no-color -detailed-exitcode \
+        -target=aws_cloudtrail.compat
+    if [ "$status" -eq 2 ]; then
+        echo "# drift detected on re-plan:" >&3
+        echo "$output" >&3
+    fi
+    [ "$status" -eq 0 ]
 }

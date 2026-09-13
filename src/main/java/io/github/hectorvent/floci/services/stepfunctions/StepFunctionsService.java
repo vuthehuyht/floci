@@ -2,11 +2,12 @@ package io.github.hectorvent.floci.services.stepfunctions;
 
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -36,14 +37,17 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.function.IntConsumer;
 
 @ApplicationScoped
 public class StepFunctionsService implements Resettable, ResourceProvider {
 
     private static final Logger LOG = Logger.getLogger(StepFunctionsService.class);
+    private static final int HISTORY_PERSIST_CHECKPOINT = 100;
 
     private final StorageBackend<String, StateMachine> stateMachineStore;
-    private final StorageBackend<String, Execution> executionStore;
+    // Account-aware: the startup sweep has no request context and must reach every account.
+    private final AccountAwareStorageBackend<Execution> executionStore;
     private final StorageBackend<String, Activity> activityStore;
     private final StorageBackend<String, MapRun> mapRunStore;
     private final Map<String, ExecutionHistory> historyCache = new ConcurrentHashMap<>();
@@ -62,9 +66,22 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
     // Fields that are valid only in JSONPath mode. Validated against real AWS:
     // creating a JSONata state machine with any of these fields returns SCHEMA_VALIDATION_FAILED.
-    private static final Set<String> JSONPATH_ONLY_FIELDS = Set.of(
+    // A List, not a Set.of: Set.of's iteration order is salted per JVM, so a state carrying more
+    // than one of these emits its diagnostics in a different order on each run, and a caller
+    // paging with maxResults=1 receives a different one every time. The order below is not
+    // AWS-observed, it is simply the one this code commits to.
+    private static final List<String> JSONPATH_ONLY_FIELDS = List.of(
             "InputPath", "OutputPath", "ResultPath", "ResultSelector", "Parameters", "Result", "ItemsPath",
-            "MaxConcurrencyPath");
+            "MaxConcurrencyPath", "ErrorPath", "CausePath");
+    // Fields that are valid only in JSONata mode. Validated against real AWS: a JSONPath state
+    // carrying any of them returns SCHEMA_VALIDATION_FAILED. Assign is deliberately absent: AWS
+    // accepts it on a JSONPath state, so it belongs to neither list. A List for the same reason as
+    // the list above, which the same expression selects between.
+    private static final List<String> JSONATA_ONLY_FIELDS = List.of("Output", "Arguments", "Items");
+    // The two spellings AWS accepts in a QueryLanguage field, exactly as written here. Any other
+    // value is reported against this enum, including one AWS still resolves to JSONata such as
+    // "jsonata" or "jsonpath".
+    private static final Set<String> QUERY_LANGUAGES = Set.of("JSONPath", "JSONata");
     // A {% %} string in one of these ASL fields is not an expression on AWS: Comment, Next,
     // Default and Resource keep it as text, ErrorEquals and Retry hold error names and integers,
     // ReaderConfig.CSVHeaders holds literal column names, and the JSONata support of
@@ -402,30 +419,38 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             return copyStateMachine(stateMachine.get());
         }
 
-        int versionSeparator = arn != null ? arn.lastIndexOf(':') : -1;
-        if (versionSeparator > 0 && versionSeparator < arn.length() - 1) {
-            String versionText = arn.substring(versionSeparator + 1);
-            if (versionText.chars().allMatch(Character::isDigit)) {
-                String baseArn = arn.substring(0, versionSeparator);
-                Optional<StateMachine> baseStateMachine = stateMachineStore.get(baseArn);
-                if (baseStateMachine.isPresent()) {
-                    return baseStateMachine.get().getVersions().stream()
-                            .filter(version -> arn.equals(version.getStateMachineVersionArn()))
-                            .findFirst()
-                            .map(version -> stateMachineFromVersion(baseStateMachine.get(), version))
-                            .orElseThrow(() -> new AwsException(
-                                    "StateMachineDoesNotExist",
-                                    "State machine does not exist", 400));
-                }
+        VersionArn parsedVersion = parseVersionArn(arn);
+        if (parsedVersion != null) {
+            Optional<StateMachine> baseStateMachine = stateMachineStore.get(parsedVersion.baseArn());
+            if (baseStateMachine.isPresent()) {
+                return baseStateMachine.get().getVersions().stream()
+                        .filter(version -> arn.equals(version.getStateMachineVersionArn()))
+                        .findFirst()
+                        .map(version -> stateMachineFromVersion(baseStateMachine.get(), version))
+                        .orElseThrow(() -> new AwsException(
+                                "StateMachineDoesNotExist",
+                                "State machine does not exist", 400));
             }
         }
         throw new AwsException(
                 "StateMachineDoesNotExist", "State machine does not exist", 400);
     }
 
+    /**
+     * Key prefix matching every Step Functions ARN in {@code region}. This store is keyed by the
+     * full ARN, unlike the other services, which key by {@code region::name}, so the prefix has to
+     * carry the region's partition or a list cannot find what a create wrote.
+     *
+     * <p>Deliberately stops before the account segment: the store holds resources for more than
+     * one account under account isolation, so {@code RegionResolver.buildArn} is the wrong helper
+     * here, since it appends its own account id.
+     */
+    private static String regionArnPrefix(String region) {
+        return "arn:" + AwsRegions.partitionFor(region) + ":states:" + region + ":";
+    }
+
     public List<StateMachine> listStateMachines(String region) {
-        String prefix = "arn:aws:states:" + region + ":";
-        return stateMachineStore.scan(k -> k.startsWith(prefix));
+        return stateMachineStore.scan(k -> k.startsWith(regionArnPrefix(region)));
     }
 
     // ── State machine versions ──────────────────────────────────────────────
@@ -489,11 +514,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     public synchronized void deleteStateMachineVersion(String stateMachineVersionArn) {
-        int lastColon = stateMachineVersionArn.lastIndexOf(':');
-        if (lastColon < 0) {
+        VersionArn parsed = parseVersionArn(stateMachineVersionArn);
+        if (parsed == null) {
             return;
         }
-        String baseArn = stateMachineVersionArn.substring(0, lastColon);
+        String baseArn = parsed.baseArn();
         stateMachineStore.get(baseArn).ifPresent(current -> {
             StateMachine updated = copyStateMachine(current);
             updated.getVersions().removeIf(
@@ -562,9 +587,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             exec.setName(execName);
             exec.setInput(input);
             exec.setStatus("RUNNING");
-            executionStore.put(arn, exec);
-
-            history = new ExecutionHistory();
+            history = new ExecutionHistory(eventCount -> {
+                if (eventCount % HISTORY_PERSIST_CHECKPOINT == 0) {
+                    executionStore.put(arn, exec);
+                }
+            });
             var startEvent = new HistoryEvent();
             startEvent.setId(1L);
             startEvent.setPreviousEventId(0L);
@@ -572,7 +599,9 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             startEvent.setDetails(Map.of("input", input != null ? input : "{}",
                                          "roleArn", sm.getRoleArn() != null ? sm.getRoleArn() : "",
                                          "inputDetails", Map.of("truncated", false)));
+            exec.setHistory(history);
             history.add(startEvent);
+            executionStore.put(arn, exec);
             historyCache.put(arn, history);
         }
 
@@ -705,42 +734,97 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     /**
      * Aborts a running execution. The caller's {@code error} and {@code cause} land on the
      * Execution itself, not only on the history event, so DescribeExecution reports them.
-     *
-     * <p>The worker thread may still be inside a state when this runs. It shares this Execution
-     * instance and reads the status it publishes here, so the writes are made under the same
-     * monitor the worker's terminal write takes: ABORTED is the status that stands.
-     *
-     * <p>ExecutionAborted seals the history for the same reason: the worker still has the state it
-     * is inside left to record, and those events belong to an execution the caller has already
-     * been told is finished.
+     * {@link #markAborted} carries the terminal write and the reasons it is made under the
+     * Execution's own monitor.
      */
     public void stopExecution(String arn, String cause, String error) {
         Execution exec = describeExecution(arn);
+        if (!markAborted(arn, exec, error, cause)) {
+            return;
+        }
+        executionStore.put(arn, exec);
+    }
+
+    /**
+     * Retires the executions a restart abandoned: they came back from storage as RUNNING with no
+     * worker behind them, and their only other writers, the worker and StopExecution, are gone.
+     * Called once at startup, before any request is served, so it takes no lock beyond the one
+     * {@link #markAborted} takes on each Execution.
+     *
+     * <p>Scans every account and writes each execution back under the account that owns it: startup
+     * has no request context, so the account-scoped accessors would silently cover only the
+     * configured default account.
+     *
+     * <p>Aborts with no error and no cause, the shape AWS returns for StopExecution called without
+     * them: the status is the whole report. The WARN below is where the reason lives.
+     */
+    public void abortAbandonedExecutions() {
+        int abandonedCount = 0;
+        for (AccountAwareStorageBackend.AccountEntry<Execution> entry
+                : executionStore.scanAllAccountEntries(key -> true)) {
+            if (!markAborted(entry.key(), entry.value(), null, null)) {
+                continue;
+            }
+            executionStore.putForAccount(entry.accountId(), entry.key(), entry.value());
+            abandonedCount++;
+        }
+        if (abandonedCount > 0) {
+            LOG.warnv("Aborted {0} Step Functions execution(s) left RUNNING by a restart",
+                    abandonedCount);
+        }
+    }
+
+    /**
+     * Writes the terminal ABORTED status on a running execution and seals the history filed under
+     * {@code arn}, returning false when the execution is already terminal. The key is the caller's
+     * because it is the one GetExecutionHistory looks the history up by: StopExecution has the ARN
+     * it was called with, the startup sweep has the storage key the entry came under. Persisting
+     * the execution is the caller's too, because StopExecution writes it under the caller's account
+     * and the sweep writes it under the account that owns the entry.
+     *
+     * <p>The worker thread may still be inside a state when StopExecution runs. It shares this
+     * Execution instance and reads the status published here, so the writes are made under the same
+     * monitor the worker's terminal write takes: ABORTED is the status that stands.
+     *
+     * <p>ExecutionAborted seals the history for the same reason: the worker still has the state it
+     * is inside left to record, and those events belong to an execution the caller has already been
+     * told is finished.
+     */
+    private boolean markAborted(String arn, Execution exec, String error, String cause) {
         synchronized (exec) {
             if (!"RUNNING".equals(exec.getStatus())) {
-                return;
+                return false;
             }
             exec.setError(error);
             exec.setCause(cause);
             exec.setStopDate(System.currentTimeMillis() / 1000.0);
             exec.setStatus("ABORTED");
         }
-        executionStore.put(arn, exec);
 
         Map<String, Object> details = new HashMap<>();
-        if (error != null) details.put("error", error);
-        if (cause != null) details.put("cause", cause);
-        // An execution can outlive its history: the executions are stored, the histories are held in
-        // memory only, so a restart in persistent mode brings a RUNNING execution back with nothing
-        // behind it. The abort still gets recorded, against a history that starts here.
-        historyCache.computeIfAbsent(arn, key -> new ExecutionHistory())
-                .sealWith("ExecutionAborted", details);
+        if (error != null) {
+            details.put("error", error);
+        }
+        if (cause != null) {
+            details.put("cause", cause);
+        }
+        // A restart can leave a RUNNING execution without its worker and token future. Preserve all
+        // persisted events, then append the terminal event that explains the deterministic recovery.
+        ExecutionHistory history = historyCache.computeIfAbsent(arn,
+                key -> new ExecutionHistory(exec.getHistory(), () -> { }, false));
+        exec.setHistory(history);
+        history.sealWith("ExecutionAborted", details);
+        return true;
     }
 
     public List<HistoryEvent> getExecutionHistory(String arn) {
-        describeExecution(arn);
-        ExecutionHistory history = historyCache.get(arn);
-        return history != null ? history : Collections.emptyList();
+        Execution exec = describeExecution(arn);
+        return historyCache.computeIfAbsent(arn,
+                key -> new ExecutionHistory(exec.getHistory(), () -> { }, isTerminal(exec.getStatus())));
+    }
+
+    private static boolean isTerminal(String status) {
+        return !"RUNNING".equals(status);
     }
 
     /**
@@ -756,14 +840,37 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
 
         private static final long serialVersionUID = 1L;
 
+        private final IntConsumer onAppend;
         private boolean sealed;
+
+        ExecutionHistory() {
+            this(eventCount -> { });
+        }
+
+        ExecutionHistory(Runnable onAppend) {
+            this(eventCount -> onAppend.run());
+        }
+
+        ExecutionHistory(IntConsumer onAppend) {
+            this.onAppend = onAppend;
+        }
+
+        ExecutionHistory(List<HistoryEvent> events, Runnable onAppend, boolean sealed) {
+            super(events != null ? events : List.of());
+            this.onAppend = eventCount -> onAppend.run();
+            this.sealed = sealed;
+        }
 
         @Override
         public synchronized boolean add(HistoryEvent event) {
             if (sealed) {
                 return false;
             }
-            return super.add(event);
+            boolean added = super.add(event);
+            if (added) {
+                onAppend.accept(size());
+            }
+            return added;
         }
 
         /** Appends the terminal event, numbered from the end of the history, and takes no more. */
@@ -802,7 +909,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
     }
 
     public List<Activity> listActivities(String region) {
-        String prefix = "arn:aws:states:" + region + ":";
+        String prefix = regionArnPrefix(region);
         return activityStore.scan(k -> k.startsWith(prefix) && k.contains(":activity:"));
     }
 
@@ -1119,25 +1226,43 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         return copy;
     }
 
+    private static final String STATE_MACHINE_RESOURCE = "stateMachine";
+
     private record VersionArn(String baseArn, int version) {
     }
 
+    /**
+     * Splits a state machine <em>version</em> ARN into its base ARN and version number, or returns
+     * {@code null} when {@code arn} is not one.
+     *
+     * <p>Decided by the shape of the resource, not by whether the tail happens to be digits. A
+     * state machine ARN is {@code stateMachine:<name>} and a version ARN is
+     * {@code stateMachine:<name>:<version>}, so the segment count settles it. Digits are legal in
+     * a state machine name, and reading the tail alone meant a machine named {@code 2024} was
+     * taken apart into version 2024 of a nameless ARN, which the caller then rejected as
+     * InvalidArn: an existing state machine that could not be described.
+     */
     private static VersionArn parseVersionArn(String arn) {
         if (arn == null) {
             return null;
         }
-        int separator = arn.lastIndexOf(':');
-        if (separator < 0 || separator == arn.length() - 1) {
+        AwsArnUtils.Arn parsed;
+        try {
+            parsed = AwsArnUtils.parse(arn);
+        } catch (IllegalArgumentException e) {
             return null;
         }
-        String suffix = arn.substring(separator + 1);
-        if (!suffix.chars().allMatch(Character::isDigit)) {
+        String[] segments = parsed.resource().split(":", -1);
+        if (segments.length != 3
+                || !STATE_MACHINE_RESOURCE.equals(segments[0])
+                || segments[2].isEmpty()
+                || !segments[2].chars().allMatch(Character::isDigit)) {
             return null;
         }
         try {
             return new VersionArn(
-                    arn.substring(0, separator),
-                    Integer.parseInt(suffix));
+                    arn.substring(0, arn.length() - segments[2].length() - 1),
+                    Integer.parseInt(segments[2]));
         } catch (NumberFormatException ignored) {
             return null;
         }
@@ -1177,7 +1302,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             "Pass", "Task", "Choice", "Wait", "Succeed", "Fail", "Parallel", "Map");
     private static final String PARSE_ERROR_MARKER = "INVALID_JSON_DESCRIPTION:";
     private static final String UNSUPPORTED_JSONATA_MARKER = "UNSUPPORTED_JSONATA_EXPRESSION:";
-    private static final String UNSUPPORTED_FIELD_MARKER = "UNSUPPORTED_FIELD:";
+    // The diagnostics whose location AWS does not compose from the offending field name: the
+    // QueryLanguage compatibility family, which it points at the state, and the QueryLanguage enum
+    // error, which it points at the field. Every other schema error has "/<field>" appended to the
+    // state path, so these travel with their message already composed and their own location.
+    private static final String EXPLICIT_LOCATION_MARKER = "EXPLICIT_LOCATION:";
     private static final String MISSING_END_STATE_MARKER = "MISSING_END_STATE:";
     private static final String UNREACHABLE_STATE_MARKER = "UNREACHABLE_STATE:";
     // Payload is "<value><SOH><location>", shared by every marker that must carry structured data
@@ -1268,8 +1397,11 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             return new Diagnostic("ERROR", "INVALID_JSONATA_EXPRESSION",
                     payload.substring(0, separator), payload.substring(separator + 1));
         }
-        if (error.startsWith(UNSUPPORTED_FIELD_MARKER)) {
-            return toUnsupportedFieldDiagnostic(error.substring(UNSUPPORTED_FIELD_MARKER.length()));
+        if (error.startsWith(EXPLICIT_LOCATION_MARKER)) {
+            String payload = error.substring(EXPLICIT_LOCATION_MARKER.length());
+            int separator = payload.indexOf(MARKER_PAYLOAD_SEPARATOR);
+            return new Diagnostic("ERROR", "SCHEMA_VALIDATION_FAILED",
+                    payload.substring(0, separator), payload.substring(separator + 1));
         }
         if (error.equals(MISSING_END_STATE_MARKER)) {
             return new Diagnostic("ERROR", "MISSING_END_STATE", "Workflow has no terminal state", null);
@@ -1312,16 +1444,6 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
         }
         return new Diagnostic("ERROR", code,
                 message.substring(0, locationMatcher.start()).trim(), locationMatcher.group(1));
-    }
-
-    // Payload is "<field name> <location>"; unlike the generic schema-error shape, AWS points this
-    // diagnostic at the state itself rather than appending the field name to the location.
-    private static Diagnostic toUnsupportedFieldDiagnostic(String payload) {
-        int separator = payload.indexOf(' ');
-        String field = payload.substring(0, separator);
-        String location = payload.substring(separator + 1);
-        return new Diagnostic("ERROR", "SCHEMA_VALIDATION_FAILED",
-                "Field '" + field + "' is not supported", location);
     }
 
     private static void validateStateMachineName(String name) {
@@ -1622,14 +1744,15 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             errors.add("The field 'StartAt' is required and must be a non-empty string");
         }
 
+        validateQueryLanguageValue(def, "/QueryLanguage", errors);
+
         JsonNode states = def.get("States");
         if (states == null || !states.isObject() || states.isEmpty()) {
             errors.add("The field 'States' is required and must be a non-empty object");
             return errors;
         }
 
-        String topLevelQL = def.path("QueryLanguage").asText("JSONPath");
-        boolean topLevelJsonata = "JSONata".equals(topLevelQL);
+        boolean topLevelJsonata = resolvesToJsonata(def, false);
 
         Set<String> topLevelStateNames = new HashSet<>();
         states.fieldNames().forEachRemaining(topLevelStateNames::add);
@@ -1749,8 +1872,72 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                                                       String stateType, List<String> errors) {
         for (FieldStateTypeRule rule : FIELDS_ALLOWED_STATE_TYPES) {
             if (stateDef.has(rule.field()) && !rule.allowedTypes().contains(stateType)) {
-                errors.add(UNSUPPORTED_FIELD_MARKER + rule.field() + " " + statePath);
+                errors.add(EXPLICIT_LOCATION_MARKER + "Field '" + rule.field() + "' is not supported"
+                        + MARKER_PAYLOAD_SEPARATOR + statePath);
             }
+        }
+    }
+
+    /**
+     * A field belonging to the other query language is refused on both sides. AWS reports this
+     * family at the state, never at the offending field, which is why it carries its location.
+     */
+    private static void reportFieldsOfTheOtherLanguage(String statePath, JsonNode stateDef,
+                                                       boolean stateIsJsonata, List<String> errors) {
+        List<String> fieldsOfTheOtherLanguage =
+                stateIsJsonata ? JSONPATH_ONLY_FIELDS : JSONATA_ONLY_FIELDS;
+        String otherLanguage = stateIsJsonata ? "JSONPath" : "JSONata";
+        for (String field : fieldsOfTheOtherLanguage) {
+            if (stateDef.has(field)) {
+                errors.add(EXPLICIT_LOCATION_MARKER + "The QueryLanguage is set to '"
+                        + (stateIsJsonata ? "JSONata" : "JSONPath") + "', but field '" + field
+                        + "' is only supported for the '" + otherLanguage + "' QueryLanguage"
+                        + MARKER_PAYLOAD_SEPARATOR + statePath);
+            }
+        }
+    }
+
+    /**
+     * The effective query language of one state, or of the state machine when {@code owner} is the
+     * definition itself. Measured against real AWS: the language is JSONPath only when the field is
+     * exactly the string {@code "JSONPath"}. Absent, it is inherited; present and anything else,
+     * the wrong case, an unknown string and a non-string alike, the owner is JSONata. The spelling
+     * is reported separately by {@link #validateQueryLanguageValue}, which runs whatever this
+     * resolves to.
+     */
+    private static boolean resolvesToJsonata(JsonNode owner, boolean inheritedJsonata) {
+        JsonNode declared = owner.path("QueryLanguage");
+        if (declared.isMissingNode()) {
+            return inheritedJsonata;
+        }
+        return !declaresJsonPath(owner);
+    }
+
+    /** The exact string that is the one way to ask for JSONPath, and the one trigger of the downgrade. */
+    private static boolean declaresJsonPath(JsonNode owner) {
+        return "JSONPath".equals(owner.path("QueryLanguage").asText(null));
+    }
+
+    /**
+     * Reports a declared {@code QueryLanguage} against AWS's enum. Measured on real AWS: this one
+     * is located at the field, {@code /States/X/QueryLanguage} or {@code /QueryLanguage}, and not at
+     * the state like the compatibility messages, and it is returned on top of whatever the resolved
+     * language produced.
+     */
+    private static void validateQueryLanguageValue(JsonNode owner, String location,
+                                                   List<String> errors) {
+        JsonNode declared = owner.path("QueryLanguage");
+        if (declared.isMissingNode()) {
+            return;
+        }
+        if (!declared.isTextual()) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "Expected value of type [STRING]"
+                    + MARKER_PAYLOAD_SEPARATOR + location);
+            return;
+        }
+        if (!QUERY_LANGUAGES.contains(declared.asText())) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "Value should be one of the following: "
+                    + "[JSONPath, JSONata]" + MARKER_PAYLOAD_SEPARATOR + location);
         }
     }
 
@@ -1777,20 +1964,27 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                 || stateDef.path("Choices").isEmpty())) {
             errors.add("Choice state must declare a non-empty field 'Choices' at " + statePath);
         }
-        String stateQL = stateDef.path("QueryLanguage").asText(null);
-        boolean stateIsJsonata = stateQL != null ? "JSONata".equals(stateQL) : topLevelJsonata;
+        boolean stateIsJsonata = resolvesToJsonata(stateDef, topLevelJsonata);
+
+        // A JSONata state machine cannot be reverted to JSONPath one state at a time. The upgrade
+        // in the other direction is allowed, which is why this reads the machine's language.
+        boolean downgradedToJsonPath = topLevelJsonata && declaresJsonPath(stateDef);
+        if (downgradedToJsonPath) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "'QueryLanguage' can not be 'JSONPath' if set to "
+                    + "'JSONata' for whole state machine" + MARKER_PAYLOAD_SEPARATOR + statePath);
+        }
 
         validateFieldsAllowedForType(statePath, stateDef, stateType, errors);
         validateTransitionTargets(statePath, stateDef, siblingStateNames, errors);
 
-        // JSONPath-only fields are not allowed when the state uses JSONata
+        // Measured on AWS: the downgrade is the whole answer for that state, and the fields its
+        // refused language forbids are not named on top of it. Only this check is skipped; every
+        // other one, the Map's MaxConcurrency range among them, still runs.
+        if (!downgradedToJsonPath) {
+            reportFieldsOfTheOtherLanguage(statePath, stateDef, stateIsJsonata, errors);
+        }
+        validateQueryLanguageValue(stateDef, statePath + "/QueryLanguage", errors);
         if (stateIsJsonata) {
-            for (String field : JSONPATH_ONLY_FIELDS) {
-                if (stateDef.has(field)) {
-                    errors.add("The QueryLanguage is set to 'JSONata', but field '" + field
-                            + "' is only supported for the 'JSONPath' QueryLanguage at " + statePath);
-                }
-            }
             collectTopLevelReferences(statePath, stateDef, errors);
         }
 
@@ -1804,6 +1998,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
             }
         }
 
+        if ("Fail".equals(stateType)) {
+            validateFailErrorAndCauseFields(statePath, stateDef, errors);
+        }
+
         if ("Map".equals(stateType)) {
             validateMapConcurrency(statePath, stateDef, stateIsJsonata, errors);
             if (stateDef.has("ItemReader")) {
@@ -1813,18 +2011,17 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                 validateResultWriter(statePath, stateDef.get("ResultWriter"), stateIsJsonata, errors);
             }
             String processorField = stateDef.has("ItemProcessor") ? "ItemProcessor" : "Iterator";
-            String processorPath = statePath + "/" + processorField;
-            JsonNode processor = stateDef.path(processorField);
-            validateNestedStates(processor.path("States"), processorPath + "/States", processorPath + "/StartAt",
-                    processor.path("StartAt").asText(null), topLevelJsonata, errors);
+            // The sub-workflow's states default to the state machine's query language, not to this
+            // Map's: the ASL specification calls the two independent.
+            validateSubWorkflow(stateDef.path(processorField), statePath + "/" + processorField,
+                    topLevelJsonata, errors);
         } else if ("Parallel".equals(stateType)) {
             JsonNode branches = stateDef.path("Branches");
             if (branches.isArray()) {
                 for (int i = 0; i < branches.size(); i++) {
-                    JsonNode branch = branches.path(i);
-                    String branchPath = statePath + "/Branches[" + i + "]";
-                    validateNestedStates(branch.path("States"), branchPath + "/States", branchPath + "/StartAt",
-                            branch.path("StartAt").asText(null), topLevelJsonata, errors);
+                    // Same rule as ItemProcessor above: the branch inherits the machine's language.
+                    validateSubWorkflow(branches.path(i), statePath + "/Branches[" + i + "]",
+                            topLevelJsonata, errors);
                 }
             }
         }
@@ -1926,18 +2123,65 @@ public class StepFunctionsService implements Resettable, ResourceProvider {
                 + "' at the top level is not supported. at " + path);
     }
 
-    private void validateNestedStates(JsonNode states, String statesPath, String startAtLocation,
-                                      String startAt, boolean inheritedJsonata, List<String> errors) {
+    /**
+     * Validates a Map's {@code ItemProcessor} or {@code Iterator}, or one of a Parallel's
+     * {@code Branches}. {@code inheritedJsonata} is the state machine's query language: a state in
+     * here that declares none defaults to the machine's and not to the enclosing Map's or
+     * Parallel's, which the ASL specification calls independent of it.
+     *
+     * @see <a href="https://states-language.net/spec.html">Amazon States Language, QueryLanguage</a>
+     */
+    private void validateSubWorkflow(JsonNode subWorkflow, String subWorkflowPath,
+                                     boolean inheritedJsonata, List<String> errors) {
+        // A sub-workflow is not a state and declares no query language of its own.
+        if (subWorkflow.has("QueryLanguage")) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "Field 'QueryLanguage' is not supported"
+                    + MARKER_PAYLOAD_SEPARATOR + subWorkflowPath);
+        }
+        JsonNode states = subWorkflow.path("States");
         if (!states.isObject()) {
             return;
         }
+        String statesPath = subWorkflowPath + "/States";
         Set<String> stateNames = new HashSet<>();
         states.fieldNames().forEachRemaining(stateNames::add);
         states.fields().forEachRemaining(entry -> validateState(
                 statesPath + "/" + entry.getKey(), entry.getValue(), inheritedJsonata, stateNames, errors));
         // Unlike the top level, MISSING_END_STATE does not apply here: ItemProcessor and Branches
         // are always walked for reachability regardless of whether they have a terminal state.
-        validateReachability(statesPath, states, startAt, startAtLocation, errors);
+        validateReachability(statesPath, states, subWorkflow.path("StartAt").asText(null),
+                subWorkflowPath + "/StartAt", errors);
+    }
+
+    /**
+     * A Fail state resolves its {@code Error} either from the literal {@code Error} field or
+     * dynamically from {@code ErrorPath}, never both; the same holds for {@code Cause} and
+     * {@code CausePath}. Real AWS refuses a definition that specifies both at CreateStateMachine.
+     */
+    private static void validateFailErrorAndCauseFields(String statePath, JsonNode stateDef, List<String> errors) {
+        if (stateDef.has("Error") && stateDef.has("ErrorPath")) {
+            errors.add("A Fail state cannot include both field 'Error' and 'ErrorPath' at " + statePath);
+        }
+        if (stateDef.has("Cause") && stateDef.has("CausePath")) {
+            errors.add("A Fail state cannot include both field 'Cause' and 'CausePath' at " + statePath);
+        }
+        validateFailPathFieldIsString(statePath, stateDef, "ErrorPath", errors);
+        validateFailPathFieldIsString(statePath, stateDef, "CausePath", errors);
+    }
+
+    /**
+     * {@code ErrorPath}/{@code CausePath} are reference paths or {@code States.*} intrinsics,
+     * always given as a JSON string; a non-string value (a number, object, array, or boolean)
+     * is a definition error AWS rejects at {@code CreateStateMachine}, not something that should
+     * reach execution and fail there instead.
+     */
+    private static void validateFailPathFieldIsString(String statePath, JsonNode stateDef, String field,
+                                                       List<String> errors) {
+        JsonNode value = stateDef.get(field);
+        if (value != null && !value.isTextual()) {
+            errors.add(EXPLICIT_LOCATION_MARKER + "Expected value of type [STRING]"
+                    + MARKER_PAYLOAD_SEPARATOR + statePath + "/" + field);
+        }
     }
 
     private void validateMapConcurrency(String statePath, JsonNode stateDef,

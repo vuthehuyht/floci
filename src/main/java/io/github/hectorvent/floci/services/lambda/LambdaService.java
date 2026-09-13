@@ -81,6 +81,15 @@ public class LambdaService implements ResourceProvider {
     private static final int MAX_HANDLER_LENGTH = 128;
     private static final List<String> FUNCTION_ARCHITECTURES = List.of("x86_64", "arm64");
 
+    /**
+     * Structure members {@code UpdateFunctionConfiguration} accepts. Shape-checked before the
+     * function lookup so a malformed member reports SerializationException rather than 404 (#3051),
+     * which is why the list is named here rather than left implicit in the extraction below.
+     */
+    private static final List<String> CONFIG_STRUCTURE_MEMBERS = List.of(
+            "Environment", "EphemeralStorage", "TracingConfig", "DeadLetterConfig",
+            "VpcConfig", "SnapStart", "LoggingConfig", "ImageConfig");
+
     private final LambdaFunctionStore functionStore;
     private final LambdaExecutorService executorService;
     private final LambdaConcurrencyLimiter concurrencyLimiter;
@@ -482,6 +491,22 @@ public class LambdaService implements ResourceProvider {
                         "Function not found: " + functionName, 404));
     }
 
+    public boolean functionExists(String region, String functionName) {
+        try {
+            // The qualifier-aware read resolves an embedded alias/version and enforces the ARN's
+            // region, so a qualified reference to a nonexistent version does not pass just
+            // because the base function exists.
+            getFunction(region, functionName, null);
+            return true;
+        } catch (AwsException e) {
+            // Covers both a plain miss and a name/ARN the resolver rejects: the exception is
+            // this predicate's negative answer, logged at debug so a surprising false stays
+            // diagnosable without turning ordinary existence misses into log noise.
+            LOG.debugv("functionExists({0}, {1}) is false: {2}", region, functionName, e.getMessage());
+            return false;
+        }
+    }
+
     /**
      * Reads a function, honouring a {@code Qualifier} that selects a published version or an alias.
      *
@@ -583,7 +608,20 @@ public class LambdaService implements ResourceProvider {
 
     public LambdaFunction updateFunctionCode(String region, String functionName, Map<String, Object> request) {
         LambdaFunction fn = getFunction(region, functionName);
-        functionName = fn.getFunctionName();
+        // publishVersion copies roughly thirty fields off this same live object. Without the
+        // updaters holding the lock it copies under, an update landing mid-copy yields a snapshot
+        // that is part old code and part new configuration, carrying a sourceRevisionId that
+        // identifies neither state (issue #3007). The monitor is reentrant and per function ARN, so
+        // the nested acquisitions further down, and publishVersion's own when Publish is set, are
+        // no-ops rather than a second lock.
+        synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            return updateFunctionCodeLocked(region, fn, request);
+        }
+    }
+
+    private LambdaFunction updateFunctionCodeLocked(String region, LambdaFunction fn,
+                                                    Map<String, Object> request) {
+        String functionName = fn.getFunctionName();
         List<String> architectures = validateArchitectures(request.get("Architectures"));
 
         String zipFileBase64 = (String) request.get("ZipFile");
@@ -626,6 +664,27 @@ public class LambdaService implements ResourceProvider {
     }
 
     public LambdaFunction updateFunctionConfiguration(String region, String functionName, Map<String, Object> request) {
+        // Shape-checked ahead of the lookup, which is where #3051 put these: a malformed member on
+        // a function that does not exist reports SerializationException, not 404. Splitting the
+        // mutation into a locked body below must not move them behind the lookup, so they stay
+        // here and the locked body re-reads them. structureMember is pure, so the second read
+        // cannot fail once these have passed.
+        for (String member : CONFIG_STRUCTURE_MEMBERS) {
+            structureMember(request, member);
+        }
+
+        LambdaFunction fn = getFunction(region, functionName);
+        // Same reason as updateFunctionCode: publishVersion's snapshot copy must not observe a
+        // half-applied configuration change (issue #3007).
+        synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
+            return updateFunctionConfigurationLocked(region, fn, request);
+        }
+    }
+
+    private LambdaFunction updateFunctionConfigurationLocked(String region, LambdaFunction fn,
+                                                             Map<String, Object> request) {
+        String functionName = fn.getFunctionName();
+        List<String> architectures = validateArchitectures(request.get("Architectures"));
         Map<String, Object> environment = structureMember(request, "Environment");
         Map<String, String> environmentVariables = environmentVariables(environment);
         Map<String, Object> ephemeralStorage = structureMember(request, "EphemeralStorage");
@@ -635,9 +694,6 @@ public class LambdaService implements ResourceProvider {
         Map<String, Object> snapStart = structureMember(request, "SnapStart");
         Map<String, Object> loggingConfig = structureMember(request, "LoggingConfig");
         Map<String, Object> imageConfig = structureMember(request, "ImageConfig");
-
-        LambdaFunction fn = getFunction(region, functionName);
-        List<String> architectures = validateArchitectures(request.get("Architectures"));
 
         // Validated before any field mutation below, not inline where Layers is applied further
         // down - fn is the live object backing this store entry (InMemoryStorage#get returns the
@@ -850,7 +906,8 @@ public class LambdaService implements ResourceProvider {
         synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
             warmPool.drainEnvironment(version.get());
             functionStore.deleteVersion(region, name, qualifier);
-            // The snapshot shares $LATEST's code directory, so this only reclaims once no
+            reclaimVersionCodeDirectory(region, fn, qualifier, version.get());
+            // The snapshot may still share $LATEST's code directory, so this only reclaims once no
             // remaining version references it.
             reclaimLegacyCodeDirectoryIfUnused(name);
         }
@@ -873,7 +930,7 @@ public class LambdaService implements ResourceProvider {
             if (concurrencyLimiter != null) {
                 concurrencyLimiter.reset(arn);
             }
-            codeStore.delete(ownerAccount(fn), functionName);
+            codeStore.delete(ownerAccount(fn), region, functionName);
             functionStore.delete(region, functionName);
             reclaimLegacyCodeDirectoryIfUnused(functionName);
             versionCounters.remove(versionCounterKey(region, fn));
@@ -894,6 +951,28 @@ public class LambdaService implements ResourceProvider {
             }
         }
         LOG.infov("Deleted Lambda function: {0}", functionName);
+    }
+
+    /**
+     * Drops the code directory a deleted version owned. Without this the only thing that ever
+     * reclaimed version code was deleting the whole function, so a repeated publish/delete cycle
+     * left one package on disk per version ever published.
+     *
+     * <p>Guarded on the version actually owning that directory rather than deleting it outright.
+     * A version whose copy could not be made fell back to {@code $LATEST}'s path, and image-backed
+     * and hot-reload versions never had a copy at all: for those the recorded path is the live
+     * function's own directory, and removing it would delete the code {@code $LATEST} still runs.
+     */
+    private void reclaimVersionCodeDirectory(String region, LambdaFunction fn, String version, LambdaFunction snapshot) {
+        String recorded = snapshot.getCodeLocalPath();
+        if (recorded == null) {
+            return;
+        }
+        String owned = codeStore.getVersionCodePath(ownerAccount(fn), region, fn.getFunctionName(), version)
+                .toAbsolutePath().normalize().toString();
+        if (owned.equals(Path.of(recorded).toAbsolutePath().normalize().toString())) {
+            codeStore.deleteVersion(ownerAccount(fn), region, fn.getFunctionName(), version);
+        }
     }
 
     /**
@@ -1197,6 +1276,7 @@ public class LambdaService implements ResourceProvider {
         ResolvedFunctionTarget target = resolveFunctionTarget(resolvedRegion, fnRef);
 
         int batchSize = toInt(request.get("BatchSize"), 10);
+        Integer maximumBatchingWindowInSeconds = parseMaximumBatchingWindow(request);
         boolean enabled = !Boolean.FALSE.equals(request.get("Enabled"));
 
         @SuppressWarnings("unchecked")
@@ -1229,6 +1309,7 @@ public class LambdaService implements ResourceProvider {
         esm.setQueueUrl(queueUrl);
         esm.setRegion(resolvedRegion);
         esm.setBatchSize(batchSize);
+        esm.setMaximumBatchingWindowInSeconds(maximumBatchingWindowInSeconds);
         esm.setEnabled(enabled);
         esm.setState(enabled ? "Enabled" : "Disabled");
         esm.setScalingConfig(scalingConfig);
@@ -1590,6 +1671,33 @@ public class LambdaService implements ResourceProvider {
         return new ScalingConfig((int) longValue);
     }
 
+    /**
+     * Parses {@code MaximumBatchingWindowInSeconds} out of a create/update request and applies
+     * AWS-level validation: it must be an integer in [0, 300]. Returns {@code null} when the field
+     * is absent so a create leaves it unset and an update leaves the stored value untouched.
+     */
+    private Integer parseMaximumBatchingWindow(Map<String, Object> request) {
+        Object raw = request.get("MaximumBatchingWindowInSeconds");
+        if (raw == null) {
+            return null;
+        }
+        if (!(raw instanceof Number)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "MaximumBatchingWindowInSeconds must be a numeric value", 400);
+        }
+        double d = ((Number) raw).doubleValue();
+        if (Double.isNaN(d) || Double.isInfinite(d) || d != Math.floor(d)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "MaximumBatchingWindowInSeconds must be an integer", 400);
+        }
+        long value = ((Number) raw).longValue();
+        if (value < 0 || value > 300) {
+            throw new AwsException("InvalidParameterValueException",
+                    "MaximumBatchingWindowInSeconds must be between 0 and 300 (got " + value + ")", 400);
+        }
+        return (int) value;
+    }
+
     private void startPollingHelper(EventSourceMapping esm) {
         if (esm.getEventSourceArn() == null) {
             return;
@@ -1641,6 +1749,9 @@ public class LambdaService implements ResourceProvider {
 
         if (request.containsKey("BatchSize")) {
             esm.setBatchSize(toInt(request.get("BatchSize"), esm.getBatchSize()));
+        }
+        if (request.containsKey("MaximumBatchingWindowInSeconds")) {
+            esm.setMaximumBatchingWindowInSeconds(parseMaximumBatchingWindow(request));
         }
         if (request.containsKey("Enabled")) {
             boolean nowEnabled = !Boolean.FALSE.equals(request.get("Enabled"));
@@ -1792,6 +1903,31 @@ public class LambdaService implements ResourceProvider {
                 .max(java.util.Comparator.comparingLong(v -> Long.parseLong(v.getVersion())));
     }
 
+    /**
+     * Copies the function's current code into a directory belonging to this version, falling back
+     * to {@code $LATEST}'s path if there is nothing to copy or the copy fails.
+     *
+     * <p>A copy failure must not fail the publish: the version is still a correct snapshot of the
+     * configuration, and falling back leaves it exactly as good as every version published before
+     * this existed, rather than turning a working call into an error.
+     */
+    private String versionCodePath(String region, LambdaFunction fn, String version) {
+        String current = fn.getCodeLocalPath();
+        if (current == null || fn.getHotReloadHostPath() != null) {
+            return current;
+        }
+        try {
+            Path copied = codeStore.copyForVersion(
+                    ownerAccount(fn), region, fn.getFunctionName(), version, Path.of(current));
+            return copied == null ? current : copied.toAbsolutePath().normalize().toString();
+        } catch (IOException e) {
+            LOG.warnv("Could not give version {0} of {1} its own code directory, "
+                            + "falling back to the shared one: {2}",
+                    version, fn.getFunctionName(), e.getMessage());
+            return current;
+        }
+    }
+
     private int nextVersionNumber(String counterKey, String legacyCounterKey) {
         synchronized (versionCounterLocks.computeIfAbsent(counterKey, k -> new Object())) {
             Integer current = versionCounters.get(counterKey);
@@ -1852,9 +1988,10 @@ public class LambdaService implements ResourceProvider {
         // delete, persisting a snapshot.codeLocalPath (below) that names a directory about to
         // be removed as unreferenced.
         synchronized (lockForConcurrencyOp(fn.getFunctionArn())) {
-            // Inside the lock UpdateFunctionCode takes, so the hash cannot be checked against one
-            // version of $LATEST and the snapshot then taken from another. Checking it outside
-            // would let an overlapping deploy publish code the caller never authorised.
+            // Inside the lock UpdateFunctionCode and UpdateFunctionConfiguration now take, so the
+            // hash cannot be checked against one version of $LATEST and the snapshot then taken
+            // from another. Checking it outside would let an overlapping deploy publish code the
+            // caller never authorised.
             // No isBlank() exclusion here. A present but empty value was previously treated as
             // absent, so it skipped the comparison entirely and published without checking
             // anything, which is the failure this precondition exists to prevent. It is simply
@@ -1908,7 +2045,13 @@ public class LambdaService implements ResourceProvider {
             // with nothing in it, and hangs to the function timeout instead of failing (#1987). A
             // published version is an immutable snapshot of code plus configuration, so it carries the
             // code location for every package type, not only Zip.
-            snapshot.setCodeLocalPath(fn.getCodeLocalPath());
+            // A version's own copy of the code, not a reference to $LATEST's directory. Sharing that
+            // directory meant a later UpdateFunctionCode rewrote what an already-published version
+            // ran, so the version advertised one CodeSha256 over a different build (issue #2958).
+            // Nothing to copy for image-backed or hot-reload functions, which keep the reference
+            // they had: an image is already immutable by digest, and a hot-reload function's whole
+            // point is that its bind-mounted directory tracks the developer's working tree.
+            snapshot.setCodeLocalPath(versionCodePath(region, fn, String.valueOf(version)));
             snapshot.setCodeSha256(fn.getCodeSha256());
             snapshot.setS3Bucket(fn.getS3Bucket());
             snapshot.setS3Key(fn.getS3Key());
@@ -2123,6 +2266,16 @@ public class LambdaService implements ResourceProvider {
     /**
      * LogGroup is the one LoggingConfig member with a documented length and character
      * constraint rather than an enum: 1-512 characters, {@code [.\-_/#A-Za-z0-9]+}.
+     *
+     * <p>A blank LogGroup (empty or whitespace-only) is deliberately read as "not supplied"
+     * rather than as a violation of that 1-character minimum, so {@link #applyLoggingConfig}
+     * falls back to the {@code /aws/lambda/} default exactly as it does for an absent member.
+     * The minimum is real in the service model, but botocore enforces it client side, so an
+     * empty LogGroup never reaches the wire from an SDK caller and nobody has observed what
+     * the service itself answers to one. Rejecting it here would be a 400 we inferred rather
+     * than measured; accepting it costs a caller nothing. That leniency is pinned by
+     * {@code LambdaVpcSnapStartLoggingIntegrationTest}, so a later reader who wants the
+     * minimum enforced has to change the decision, not just the guard.
      */
     private static void validateLogGroup(Object value) {
         if (!(value instanceof String group) || group.isBlank()) {
@@ -2589,13 +2742,18 @@ public class LambdaService implements ResourceProvider {
     }
 
     private void extractZipCode(LambdaFunction fn, String zipFileBase64, String region) {
-        extractZipCodeBytes(fn, Base64.getDecoder().decode(zipFileBase64), region);
+        byte[] zipBytes = Base64.getDecoder().decode(zipFileBase64);
+        if (zipBytes.length > ZipExtractor.DIRECT_UPLOAD_MAX_COMPRESSED_BYTES) {
+            throw new AwsException("RequestEntityTooLargeException",
+                    "Request must be smaller than 52428800 bytes.", 413);
+        }
+        extractZipCodeBytes(fn, zipBytes, region);
     }
 
     private void extractZipCodeBytes(LambdaFunction fn, byte[] zipBytes, String region) {
-        Path codePath = codeStore.getCodePath(ownerAccount(fn), fn.getFunctionName());
+        Path codePath = codeStore.getCodePath(ownerAccount(fn), region, fn.getFunctionName());
         try {
-            zipExtractor.extractTo(zipBytes, codePath);
+            zipExtractor.extractTo(zipBytes, codePath, configuredZipMaxEntries());
             // Publish the new code identity under the same per-function lock publishVersion holds.
             // PublishVersion's CodeSha256 precondition is a check-then-act: it compares the hash and
             // then snapshots the code. Mutating these fields without the lock lets an overlapping
@@ -2612,30 +2770,6 @@ public class LambdaService implements ResourceProvider {
                 fn.setCodeSizeBytes(zipBytes.length);
                 if (newSha256 != null) {
                     fn.setCodeSha256(newSha256);
-                }
-            }
-
-            // For file-based runtimes, verify handler file exists (skip Java and .NET which use different handler formats)
-            if (fn.getRuntime() != null && !fn.getRuntime().startsWith("java") && !fn.getRuntime().startsWith("dotnet")) {
-                String handlerFile = resolveHandlerFilePath(fn);
-                boolean pythonRuntime = fn.getRuntime().startsWith("python");
-                boolean found;
-                try (var walk = Files.walk(codePath)) {
-                    found = walk
-                            .filter(Files::isRegularFile)
-                            .anyMatch(p -> {
-                                String relative = codePath.relativize(p).toString();
-                                String withoutExt = relative.contains(".")
-                                        ? relative.substring(0, relative.lastIndexOf('.'))
-                                        : relative;
-                                String normalized = withoutExt.replace('\\', '/');
-                                return normalized.equals(handlerFile)
-                                        || (pythonRuntime && normalized.equals(handlerFile + "/__init__"));
-                            });
-                }
-                if (!found) {
-                    throw new AwsException("InvalidParameterValueException",
-                            "Handler file '" + handlerFile + "' not found in deployment package", 400);
                 }
             }
 
@@ -2656,6 +2790,19 @@ public class LambdaService implements ResourceProvider {
             throw new AwsException("InvalidParameterValueException",
                     "Failed to extract deployment package: " + e.getMessage(), 400);
         }
+    }
+
+    private int configuredZipMaxEntries() {
+        if (config == null || config.services() == null || config.services().lambda() == null) {
+            return ZipExtractor.DEFAULT_MAX_ENTRIES;
+        }
+        int configured = config.services().lambda().zipMaxEntries();
+        if (configured < 1) {
+            LOG.warnv("Ignoring invalid Lambda ZIP entry limit {0}; using {1}",
+                    configured, ZipExtractor.DEFAULT_MAX_ENTRIES);
+            return ZipExtractor.DEFAULT_MAX_ENTRIES;
+        }
+        return configured;
     }
 
     private void storeDeploymentPackage(LambdaFunction fn, byte[] zipBytes, String region) {
@@ -2722,22 +2869,6 @@ public class LambdaService implements ResourceProvider {
                     "Unable to fetch code from s3://" + s3Bucket + "/" + s3Key + ": " + e.getMessage(), 400);
         }
         extractZipCodeBytes(fn, obj.getData(), region);
-    }
-
-    private String resolveHandlerFilePath(LambdaFunction fn) {
-        String handler = fn.getHandler();
-        int lastDot = handler.lastIndexOf('.');
-        String modulePath = lastDot >= 0 ? handler.substring(0, lastDot) : handler;
-        if (fn.getRuntime().startsWith("python")) {
-            return modulePath.replace('.', '/');
-        }
-        // A file-based handler may be given with a leading "./" (e.g.
-        // "./v1/lambda-handlers/entry.handler"); deployment-package entries are stored without
-        // it, so normalize the prefix away before matching.
-        if (modulePath.startsWith("./")) {
-            modulePath = modulePath.substring(2);
-        }
-        return modulePath;
     }
 
     private void applyHotReload(LambdaFunction fn, String hostPath) {

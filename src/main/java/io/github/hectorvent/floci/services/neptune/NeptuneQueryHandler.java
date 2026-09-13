@@ -65,7 +65,8 @@ public class NeptuneQueryHandler {
             return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.RDS, e.getHttpStatus());
         } catch (Exception e) {
             LOG.errorv(e, "Unexpected error in Neptune {0}", action);
-            return Response.serverError().entity("Unexpected error: " + e.getMessage()).build();
+            return AwsQueryResponse.error("InternalFailure",
+                    "Unexpected error: " + e.getMessage(), AwsNamespaces.RDS, 500);
         }
     }
 
@@ -113,8 +114,8 @@ public class NeptuneQueryHandler {
     /**
      * The rows the list form of DescribeDBClusters would return for the region a request is signed
      * for, for the RDS-family listing {@code RdsQueryHandler} assembles: a live account lists
-     * Neptune clusters from the RDS endpoint too. The Neptune store is not keyed by region, so the
-     * region is read off each record's ARN.
+     * Neptune clusters from the RDS endpoint too. The service storage is scoped by account and
+     * region before the rows are rendered.
      */
     public List<String> clusterRowsXml(String filterId, String region) {
         return service.listDbClusters(filterId).stream()

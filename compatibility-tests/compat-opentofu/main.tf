@@ -287,7 +287,14 @@ resource "aws_elasticache_replication_group" "compat" {
   engine               = "redis"
   node_type            = "cache.t3.micro"
   num_cache_clusters   = 1
-  port                 = 6379
+  # Deliberately not 6379: that is the bottom of floci's ElastiCache proxy range and the
+  # port it would hand out anyway, so pinning it asserts nothing. A non-default port is
+  # what actually exercises CreateReplicationGroup's Port input, and a mismatch shows up
+  # as permanent drift because Terraform treats the port as replacement-forcing.
+  #
+  # It must also stay above the block the cluster-mode fixture allocates: the bats files
+  # run concurrently and that fixture takes one port per node from the base of the range.
+  port                 = 6395
 }
 
 # ── Firehose Delivery Stream ────────────────────────────────────────────────
@@ -575,8 +582,43 @@ resource "aws_ses_active_receipt_rule_set" "compat" {
   rule_set_name = aws_ses_receipt_rule_set.compat.rule_set_name
 }
 
+resource "aws_ses_receipt_filter" "compat" {
+  name   = "floci-compat-filter"
+  cidr   = "10.10.10.0/24"
+  policy = "Block"
+}
+
+resource "aws_ses_receipt_rule" "compat" {
+  rule_set_name = aws_ses_receipt_rule_set.compat.rule_set_name
+  name          = "floci-compat-rule"
+  enabled       = true
+  scan_enabled  = true
+  tls_policy    = "Optional"
+  recipients    = ["compat@example.com"]
+
+  add_header_action {
+    header_name  = "X-Floci-Compat"
+    header_value = "true"
+    position     = 1
+  }
+
+  sns_action {
+    topic_arn = aws_sns_topic.events.arn
+    position  = 2
+  }
+
+  stop_action {
+    scope    = "RuleSet"
+    position = 3
+  }
+}
+
 output "ses_rule_set_name" {
   value = aws_ses_receipt_rule_set.compat.rule_set_name
+}
+
+output "ses_receipt_rule_name" {
+  value = aws_ses_receipt_rule.compat.name
 }
 
 # -- GuardDuty -----------------------------------------------------------------
@@ -625,4 +667,39 @@ output "guardduty_detector_id" {
 
 output "large_object_checksum_sha256" {
   value = aws_s3_object.large.checksum_sha256
+}
+
+# -- Transfer Family Server (issue #2802) --------------------------------------
+# Never stopped, so destroy exercises DeleteServer against an ONLINE server.
+resource "aws_transfer_server" "compat" {
+  protocols = ["SFTP"]
+
+  tags = {
+    Environment = "compat-test"
+  }
+}
+
+output "transfer_server_id" {
+  value = aws_transfer_server.compat.id
+}
+
+# -- CloudTrail Trail (issue #2800) --------------------------------------------
+# The provider sends tags inside CreateTrail and reads them back with ListTags on
+# every refresh, so this covers the post-create tag refresh path end to end.
+resource "aws_s3_bucket" "trail_logs" {
+  bucket        = "floci-compat-trail-logs"
+  force_destroy = true
+}
+
+resource "aws_cloudtrail" "compat" {
+  name           = "floci-compat-trail"
+  s3_bucket_name = aws_s3_bucket.trail_logs.id
+
+  tags = {
+    Environment = "compat-test"
+  }
+}
+
+output "cloudtrail_arn" {
+  value = aws_cloudtrail.compat.arn
 }

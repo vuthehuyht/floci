@@ -7,9 +7,12 @@ import io.github.hectorvent.floci.services.sns.SnsService;
 import io.github.hectorvent.floci.services.sqs.model.Message;
 import io.github.hectorvent.floci.services.sqs.model.MessageAttributeValue;
 import io.github.hectorvent.floci.services.sqs.model.Queue;
+import io.github.hectorvent.floci.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -23,11 +26,13 @@ import static org.mockito.Mockito.verify;
 class SqsServiceTest {
 
     private SqsService sqsService;
+    private MutableClock clock;
     private static final String BASE_URL = "http://localhost:4566";
 
     @BeforeEach
     void setUp() {
-        sqsService = new SqsService(new InMemoryStorage<>(), 30, 1048576, BASE_URL);
+        clock = new MutableClock();
+        sqsService = new SqsService(new InMemoryStorage<>(), 30, 1048576, BASE_URL, clock);
     }
 
     @Test
@@ -775,6 +780,73 @@ class SqsServiceTest {
         assertEquals(25, task.maxNumberOfMessagesPerSecond());
     }
 
+    /**
+     * The DLQ redrive path resolves a queue URL from the {@code deadLetterTargetArn} a client read
+     * back out of GetQueueAttributes, and SQS mints that ARN with the region's own partition. The
+     * resolver used to require a literal {@code arn:aws:sqs:}, so in GovCloud or China it returned
+     * null, the move block was skipped, and messages stayed on the source queue with nothing
+     * logged. A silent redrive failure is the worst shape this bug takes.
+     */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "us-east-1,      arn:aws:sqs:us-east-1:000000000000:",
+            "us-gov-west-1,  arn:aws-us-gov:sqs:us-gov-west-1:000000000000:",
+            "cn-north-1,     arn:aws-cn:sqs:cn-north-1:000000000000:"})
+    void startMessageMoveTask_acceptsAQueueArnFromAnyPartition(String region, String arnPrefix) {
+        sqsService.createQueue("p-dlq", null, region);
+        String dlqArn = arnPrefix + "p-dlq";
+        sqsService.createQueue("p-src",
+                Map.of("RedrivePolicy",
+                        "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":\"1\"}"), region);
+        sqsService.createQueue("p-dest", null, region);
+
+        String taskHandle = sqsService.startMessageMoveTask(dlqArn, arnPrefix + "p-dest", 5, region);
+
+        assertNotNull(taskHandle);
+        assertEquals(dlqArn, sqsService.listMessageMoveTasks(dlqArn, region).get(0).sourceArn());
+    }
+
+    /**
+     * The ARN the emulator itself hands back must be the one it accepts. This is the assertion
+     * that ties the two halves together rather than trusting a hand-written prefix.
+     */
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"us-east-1", "us-gov-west-1", "cn-north-1"})
+    void startMessageMoveTask_acceptsTheQueueArnGetQueueAttributesReturned(String region) {
+        sqsService.createQueue("rt-dlq", null, region);
+        String dlqArn = sqsService.getQueueAttributes(
+                sqsService.getQueueUrl("rt-dlq", region), List.of("QueueArn"), region).get("QueueArn");
+        sqsService.createQueue("rt-src",
+                Map.of("RedrivePolicy",
+                        "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":\"1\"}"), region);
+        sqsService.createQueue("rt-dest", null, region);
+        String destArn = sqsService.getQueueAttributes(
+                sqsService.getQueueUrl("rt-dest", region), List.of("QueueArn"), region).get("QueueArn");
+
+        assertNotNull(sqsService.startMessageMoveTask(dlqArn, destArn, 5, region));
+    }
+
+    /**
+     * Widening the partition must not turn "queue does not exist" into something softer: an ARN
+     * naming a queue nobody created is still ResourceNotFound, exactly as a commercial one is.
+     *
+     * <p>Note the resolver takes only the account and queue name out of the ARN and looks them up
+     * in the caller's region, so the ARN's own region is not enforced. That is pre-existing and
+     * already applied to a cross-region commercial ARN; this change does not alter it.
+     */
+    @Test
+    void startMessageMoveTask_foreignPartitionQueueThatDoesNotExistIsNotFound() {
+        sqsService.createQueue("fp-dlq", null, "us-east-1");
+        String dlqArn = queueArn("fp-dlq");
+        sqsService.createQueue("fp-src",
+                Map.of("RedrivePolicy",
+                        "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":\"1\"}"), "us-east-1");
+
+        AwsException ex = assertThrows(AwsException.class, () -> sqsService.startMessageMoveTask(
+                dlqArn, "arn:aws-cn:sqs:cn-north-1:000000000000:never-created", 0, "us-east-1"));
+        assertEquals("ResourceNotFoundException", ex.getErrorCode());
+    }
+
     @Test
     void startMessageMoveTask_destinationDoesNotExist_throwsResourceNotFound() {
         sqsService.createQueue("a-dlq", null, "us-east-1");
@@ -870,17 +942,132 @@ class SqsServiceTest {
         }
 
         String taskHandle = sqsService.startMessageMoveTask(dlqArn, destArn, 1, "us-east-1");
-        sqsService.cancelMessageMoveTask(taskHandle, "us-east-1");
+        assertEquals(1, sqsService.cancelMessageMoveTask(taskHandle, "us-east-1"));
 
-        // Give the worker a moment to observe the cancel and write the terminal status.
+        awaitMoveTaskStatus(dlqArn, taskHandle, "CANCELLED");
+    }
+
+    @Test
+    void completedMessageMoveTasks_areBoundedToRecentSummaries() throws Exception {
+        sqsService.createQueue("terminal-cap-dlq", null, "us-east-1");
+        String dlqArn = queueArn("terminal-cap-dlq");
+        sqsService.createQueue("terminal-cap-source",
+                Map.of("RedrivePolicy",
+                        "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":\"1\"}"),
+                "us-east-1");
+        sqsService.createQueue("terminal-cap-destination", null, "us-east-1");
+        String destinationArn = queueArn("terminal-cap-destination");
+
+        List<String> taskHandles = new ArrayList<>();
+        for (int i = 0; i < 11; i++) {
+            String taskHandle = sqsService.startMessageMoveTask(dlqArn, destinationArn, 0, "us-east-1");
+            taskHandles.add(taskHandle);
+            for (int attempt = 0; attempt < 50; attempt++) {
+                if (sqsService.listMessageMoveTasks(dlqArn, "us-east-1").stream()
+                        .anyMatch(task -> task.taskHandle().equals(taskHandle) && "COMPLETED".equals(task.status()))) {
+                    break;
+                }
+                Thread.sleep(10);
+            }
+            assertTrue(sqsService.listMessageMoveTasks(dlqArn, "us-east-1").stream()
+                    .anyMatch(task -> task.taskHandle().equals(taskHandle) && "COMPLETED".equals(task.status())));
+            if (i < 10) {
+                clock.advance(Duration.ofSeconds(2));
+            }
+        }
+
+        List<SqsService.MoveTask> recentTasks = sqsService.listMessageMoveTasks(dlqArn, "us-east-1");
+        assertEquals(10, recentTasks.size());
+        assertFalse(recentTasks.stream().anyMatch(task -> task.taskHandle().equals(taskHandles.getFirst())));
+
+        clock.advance(Duration.ofHours(1).plusMillis(1));
+        assertTrue(sqsService.listMessageMoveTasks(dlqArn, "us-east-1").isEmpty());
+        AwsException ex = assertThrows(AwsException.class, () ->
+                sqsService.cancelMessageMoveTask(taskHandles.getLast(), "us-east-1"));
+        assertEquals("ResourceNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    void completedMessageMoveTasks_areBoundedPerSourceQueue() throws Exception {
+        sqsService.createQueue("per-source-dlq-a", null, "us-east-1");
+        String sourceArnA = queueArn("per-source-dlq-a");
+        sqsService.createQueue("per-source-source-a",
+                Map.of("RedrivePolicy",
+                        "{\"deadLetterTargetArn\":\"" + sourceArnA + "\",\"maxReceiveCount\":\"1\"}"),
+                "us-east-1");
+        sqsService.createQueue("per-source-destination-a", null, "us-east-1");
+        String destinationArnA = queueArn("per-source-destination-a");
+
+        sqsService.createQueue("per-source-dlq-b", null, "us-east-1");
+        String sourceArnB = queueArn("per-source-dlq-b");
+        sqsService.createQueue("per-source-source-b",
+                Map.of("RedrivePolicy",
+                        "{\"deadLetterTargetArn\":\"" + sourceArnB + "\",\"maxReceiveCount\":\"1\"}"),
+                "us-east-1");
+        sqsService.createQueue("per-source-destination-b", null, "us-east-1");
+        String destinationArnB = queueArn("per-source-destination-b");
+
+        for (int i = 0; i < 10; i++) {
+            String taskHandle = sqsService.startMessageMoveTask(sourceArnA, destinationArnA, 0, "us-east-1");
+            awaitMoveTaskStatus(sourceArnA, taskHandle, "COMPLETED");
+            clock.advance(Duration.ofSeconds(2));
+        }
+        String taskHandleB = sqsService.startMessageMoveTask(sourceArnB, destinationArnB, 0, "us-east-1");
+        awaitMoveTaskStatus(sourceArnB, taskHandleB, "COMPLETED");
+
+        assertEquals(10, sqsService.listMessageMoveTasks(sourceArnA, "us-east-1").size());
+        assertEquals(1, sqsService.listMessageMoveTasks(sourceArnB, "us-east-1").size());
+    }
+
+    @Test
+    void cancelledMessageMoveTasks_areBoundedAndAllowTheNextTask() throws Exception {
+        Queue dlq = sqsService.createQueue("cancel-cap-dlq", null, "us-east-1");
+        String dlqArn = queueArn("cancel-cap-dlq");
+        sqsService.createQueue("cancel-cap-source",
+                Map.of("RedrivePolicy",
+                        "{\"deadLetterTargetArn\":\"" + dlqArn + "\",\"maxReceiveCount\":\"1\"}"),
+                "us-east-1");
+        sqsService.createQueue("cancel-cap-destination", null, "us-east-1");
+        String destinationArn = queueArn("cancel-cap-destination");
         for (int i = 0; i < 50; i++) {
-            var status = sqsService.listMessageMoveTasks(dlqArn, "us-east-1").get(0).status();
-            if ("CANCELLED".equals(status)) {
+            sqsService.sendMessage(dlq.getQueueUrl(), "msg-" + i, 0, null, null, "us-east-1");
+        }
+
+        List<String> taskHandles = new ArrayList<>();
+        for (int i = 0; i < 11; i++) {
+            String taskHandle = sqsService.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
+            taskHandles.add(taskHandle);
+            sqsService.cancelMessageMoveTask(taskHandle, "us-east-1");
+            awaitMoveTaskStatus(dlqArn, taskHandle, "CANCELLED");
+            if (i < 10) {
+                clock.advance(Duration.ofSeconds(2));
+            }
+        }
+
+        List<SqsService.MoveTask> recentTasks = sqsService.listMessageMoveTasks(dlqArn, "us-east-1");
+        assertEquals(10, recentTasks.size());
+        assertFalse(recentTasks.stream().anyMatch(task -> task.taskHandle().equals(taskHandles.getFirst())));
+
+        clock.advance(Duration.ofSeconds(2));
+        String nextTask = sqsService.startMessageMoveTask(dlqArn, destinationArn, 1, "us-east-1");
+        sqsService.cancelMessageMoveTask(nextTask, "us-east-1");
+        awaitMoveTaskStatus(dlqArn, nextTask, "CANCELLED");
+
+        clock.advance(Duration.ofHours(1).plusMillis(1));
+        assertTrue(sqsService.listMessageMoveTasks(dlqArn, "us-east-1").isEmpty());
+    }
+
+    private void awaitMoveTaskStatus(String sourceArn, String taskHandle, String expectedStatus) throws Exception {
+        for (int attempt = 0; attempt < 100; attempt++) {
+            boolean reachedStatus = sqsService.listMessageMoveTasks(sourceArn, "us-east-1").stream()
+                    .anyMatch(task -> task.taskHandle().equals(taskHandle)
+                            && expectedStatus.equals(task.status()));
+            if (reachedStatus) {
                 return;
             }
-            Thread.sleep(50);
+            Thread.sleep(10);
         }
-        fail("Move task did not transition to CANCELLED within timeout");
+        fail("Move task did not transition to " + expectedStatus + " within timeout");
     }
 
     @Test

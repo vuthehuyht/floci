@@ -87,7 +87,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private static final String SERVICE_LINKED_ROLE_NAME_PREFIX = "AWSServiceRoleFor";
     private static final Map<String, String> SERVICE_LINKED_ROLE_NAMES = Map.of(
             "autoscaling.amazonaws.com", "AutoScaling",
-            "cloud9.amazonaws.com", "AWSCloud9"
+            "cloud9.amazonaws.com", "AWSCloud9",
+            "ram.amazonaws.com", "ResourceAccessManager"
     );
     private static final String AMAZONAWS_DOMAIN = ".amazonaws.com";
     /** AWSServiceName as AWS constrains it: 1-128 characters of {@code [\w+=,.@-]}. */
@@ -275,8 +276,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         Map<String, IamPolicy> catalog = new LinkedHashMap<>();
         for (AwsManagedPolicies.ManagedPolicyDef def : AwsManagedPolicies.POLICIES) {
             String arn = def.arn();
+            // The bundled document is the policy's current default version, served under the
+            // version id AWS actually reports for it (v3 for AmazonS3ReadOnlyAccess, v1 for
+            // AdministratorAccess) so GetPolicy/ListPolicyVersions match a real account.
+            // Superseded versions are not bundled, so they resolve to NoSuchEntity.
+            Instant now = Instant.now();
+            Instant updateDate = def.updateDate() != null ? def.updateDate() : now;
+            Instant createDate = def.createDate() != null ? def.createDate() : updateDate;
+            PolicyVersion defaultVersion = new PolicyVersion(
+                    def.defaultVersionId(), def.document(), true, updateDate);
             catalog.put(arn, new IamPolicy("ANPA" + randomId(16), def.name(), def.path(), arn,
-                    def.description(), AwsManagedPolicies.PERMISSIVE_DOCUMENT));
+                    def.description(), defaultVersion, createDate, updateDate));
         }
         return catalog;
     }
@@ -395,7 +405,21 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     }
 
     public void updateUser(String userName, String newUserName, String newPath) {
+        updateUser(userName, newUserName, newPath, null);
+    }
+
+    /**
+     * Same as {@link #updateUser(String, String, String)}, but verifies {@code expectedUserId}
+     * against the resolved user's immutable ID before applying the update, atomically with the
+     * name-based lookup.
+     */
+    public void updateUser(String userName, String newUserName, String newPath, String expectedUserId) {
         IamUser user = getUser(userName);
+        if (expectedUserId != null && !expectedUserId.equals(user.getUserId())) {
+            throw new AwsException("EntityAlreadyExists",
+                    "User " + userName + " was replaced by a different user of the same name; "
+                            + "refusing to apply an update meant for the original user.", 409);
+        }
         if (newUserName != null && !newUserName.equals(userName)) {
             if (users.get(newUserName).isPresent()) {
                 throw new AwsException("EntityAlreadyExists",

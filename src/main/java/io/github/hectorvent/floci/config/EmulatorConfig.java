@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.config;
 
 import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
+import java.net.URI;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -40,6 +41,18 @@ public interface EmulatorConfig {
             url = "https://" + url.substring(7);
         }
         return url;
+    }
+
+    /**
+     * The address IoT Core's DescribeEndpoint returns for every endpoint type, also the domain
+     * name of the AWS-managed domain configurations: {@code floci.services.iot.endpoint-address}
+     * when set, otherwise the host and port of {@link #effectiveBaseUrl()}.
+     */
+    default String iotEndpointAddress() {
+        return services().iot().endpointAddress()
+                .map(String::strip)
+                .filter(address -> !address.isEmpty())
+                .orElseGet(() -> URI.create(effectiveBaseUrl()).getAuthority());
     }
 
     @WithDefault("us-east-1")
@@ -631,6 +644,7 @@ public interface EmulatorConfig {
         RdsServiceConfig rds();
         RedshiftServiceConfig redshift();
         RdsDataServiceConfig rdsData();
+        RedshiftDataServiceConfig redshiftData();
         EventBridgeServiceConfig eventbridge();
         CloudMapServiceConfig cloudmap();
         EmrServiceConfig emr();
@@ -658,6 +672,7 @@ public interface EmulatorConfig {
         AppConfigDataServiceConfig appconfigdata();
         EcrServiceConfig ecr();
         ResourceGroupsTaggingServiceConfig tagging();
+        BedrockServiceConfig bedrock();
         BedrockRuntimeServiceConfig bedrockRuntime();
         EksServiceConfig eks();
         MwaaServiceConfig mwaa();
@@ -710,21 +725,40 @@ public interface EmulatorConfig {
         NetworkFirewallServiceConfig networkfirewall();
         ServiceCatalogServiceConfig servicecatalog();
         SsoAdminServiceConfig ssoadmin();
+        SsoOidcServiceConfig ssooidc();
         Macie2ServiceConfig macie2();
+        AccountServiceConfig account();
+        AccessAnalyzerServiceConfig accessanalyzer();
+        IdentityStoreServiceConfig identitystore();
+        BudgetsServiceConfig budgets();
+        Inspector2ServiceConfig inspector2();
+        SecurityHubServiceConfig securityhub();
+        DetectiveServiceConfig detective();
         ServiceQuotasServiceConfig servicequotas();
+        VerifiedPermissionsServiceConfig verifiedpermissions();
         RamServiceConfig ram();
+        ControlCatalogServiceConfig controlcatalog();
         ControlTowerServiceConfig controltower();
         ConnectServiceConfig connect();
+        AppIntegrationsServiceConfig appintegrations();
         CognitoIdentityServiceConfig cognitoidentity();
+        GlobalAcceleratorServiceConfig globalaccelerator();
+        DataSyncServiceConfig datasync();
 
         ApsServiceConfig aps();
 
         LakeFormationServiceConfig lakeformation();
         EfsServiceConfig efs();
         CodeGuruReviewerServiceConfig codegurureviewer();
+        MarketplaceServiceConfig marketplace();
     }
 
     interface ConnectServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface AppIntegrationsServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -734,12 +768,67 @@ public interface EmulatorConfig {
         boolean enabled();
     }
 
+    interface GlobalAcceleratorServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface DataSyncServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
     interface SsoAdminServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
 
+    interface SsoOidcServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        Optional<String> localPrincipalId();
+    }
+
     interface Macie2ServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface AccountServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface AccessAnalyzerServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface IdentityStoreServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("floci-scim-token")
+        String scimBearerToken();
+    }
+
+    interface BudgetsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface Inspector2ServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface SecurityHubServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface DetectiveServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -754,9 +843,31 @@ public interface EmulatorConfig {
         boolean enabled();
     }
 
+    interface MarketplaceServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
     interface IotServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * Reject a topic rule whose SQL falls outside the subset Floci evaluates, as AWS does.
+         * Off by default, so such a rule is stored and keeps firing on every matching topic
+         * with the whole payload.
+         */
+        @WithDefault("false")
+        boolean ruleSqlStrict();
+
+        /**
+         * Returned as is by DescribeEndpoint for every endpoint type when set. AWS returns a bare
+         * hostname and clients add their own port: 8883 for MQTT, 443 for HTTPS and MQTT over
+         * WebSocket, 8443 for HTTPS with a client certificate. Set it when those ports reach Floci
+         * (8883 to the MQTT TLS listener, 443 and 8443 to the HTTPS listener). Unset, DescribeEndpoint
+         * returns the host and port of the base URL. Env: FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS
+         */
+        Optional<String> endpointAddress();
 
         MqttConfig mqtt();
     }
@@ -773,6 +884,13 @@ public interface EmulatorConfig {
 
         @WithDefault("1883")
         int port();
+
+        /**
+         * MQTT over TLS listener, the port AWS IoT serves for X.509 device connections. Opened only
+         * while {@code floci.tls.enabled} is true; {@code 0} disables it. Env: FLOCI_SERVICES_IOT_MQTT_TLS_PORT
+         */
+        @WithDefault("8883")
+        int tlsPort();
     }
 
     interface IotDataServiceConfig {
@@ -781,6 +899,11 @@ public interface EmulatorConfig {
     }
 
     interface RumServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface ControlCatalogServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -821,6 +944,17 @@ public interface EmulatorConfig {
     interface ServiceQuotasServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface VerifiedPermissionsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** When set, Floci uses this URL and skips Cedar sidecar container management. */
+        Optional<String> cedarUrl();
+
+        @WithDefault("floci/floci:latest-cedar")
+        String cedarImage();
     }
 
     interface RamServiceConfig {
@@ -1086,6 +1220,31 @@ public interface EmulatorConfig {
 
         @WithDefault("rabbitmq:3-management")
         String defaultImage();
+
+        /**
+         * Host port range the AMQP listener (container port 5672) is published on, one
+         * port per broker. Published in both topologies: no Floci-internal proxy fronts
+         * the broker, so the Docker host-port binding is the only way a client outside
+         * the Docker network (e.g. on the host, with Floci itself containerized) can
+         * reach it (#3240). Env: FLOCI_SERVICES_AMAZONMQ_AMQP_HOST_PORT_BASE
+         */
+        @WithDefault("5672")
+        int amqpHostPortBase();
+
+        /** Env: FLOCI_SERVICES_AMAZONMQ_AMQP_HOST_PORT_MAX */
+        @WithDefault("5699")
+        int amqpHostPortMax();
+
+        /**
+         * Host port range the RabbitMQ management console (container port 15672) is
+         * published on. Env: FLOCI_SERVICES_AMAZONMQ_CONSOLE_HOST_PORT_BASE
+         */
+        @WithDefault("15672")
+        int consoleHostPortBase();
+
+        /** Env: FLOCI_SERVICES_AMAZONMQ_CONSOLE_HOST_PORT_MAX */
+        @WithDefault("15699")
+        int consoleHostPortMax();
     }
 
     interface KinesisAnalyticsServiceConfig {
@@ -1172,6 +1331,11 @@ public interface EmulatorConfig {
         // Hostname clients use to reach a cluster endpoint. Empty -> resolved from
         // DockerHostResolver (falls back to "localhost").
         Optional<String> endpointHost();
+
+        // Default lifetime for GetClusterCredentials / GetClusterCredentialsWithIAM when
+        // DurationSeconds is omitted. AWS allows 900 to 3600.
+        @WithDefault("900")
+        int defaultCredentialDurationSeconds();
     }
 
     interface RdsServiceConfig {
@@ -1216,6 +1380,14 @@ public interface EmulatorConfig {
 
         @WithDefault("180")
         long transactionTtlSeconds();
+    }
+
+    interface RedshiftDataServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        @WithDefault("24")
+        int resultTtlHours();
     }
 
     interface NeptuneServiceConfig {
@@ -1373,6 +1545,14 @@ public interface EmulatorConfig {
          */
         @WithDefault("0")
         int flushRecordCount();
+
+        /**
+         * S3 bucket used to stage validated NDJSON batches before DuckDB writes
+         * the Parquet object for data-format-converting delivery streams.
+         * Created on first use if it doesn't exist.
+         */
+        @WithDefault("floci-firehose-staging")
+        String stagingBucket();
     }
 
     interface KmsServiceConfig {
@@ -1574,6 +1754,11 @@ public interface EmulatorConfig {
     }
 
     interface ResourceGroupsTaggingServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
+    interface BedrockServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -1885,6 +2070,14 @@ public interface EmulatorConfig {
         @WithDefault("./data/lambda-code")
         String codePath();
 
+        /**
+         * Maximum number of entries accepted in a Lambda ZIP archive.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ZIP_MAX_ENTRIES
+         */
+        @WithDefault("100000")
+        int zipMaxEntries();
+
         @WithDefault("1000")
         long pollIntervalMs();
 
@@ -2081,6 +2274,18 @@ public interface EmulatorConfig {
          */
         Optional<Boolean> containerIpsRoutable();
 
+        /**
+         * When true, Floci removes on startup any EC2 instance container left on the Docker
+         * daemon by a previous run of <em>this same</em> Floci (matched by the
+         * {@code floci_owner_port} label) whose instance record did not survive the restart, or
+         * came back already terminated. Stopped instances are never swept — their containers are
+         * exactly what StartInstances revives.
+         *
+         * Env var: FLOCI_SERVICES_EC2_RECONCILE_CONTAINERS_ON_STARTUP
+         */
+        @WithDefault("true")
+        boolean reconcileContainersOnStartup();
+
         /** Port on the Floci host for the IMDS HTTP server (169.254.169.254 equivalent). */
         @WithDefault("9169")
         int imdsPort();
@@ -2124,6 +2329,43 @@ public interface EmulatorConfig {
         /** When true, instances go straight to RUNNING without launching Docker containers. */
         @WithDefault("false")
         boolean mock();
+
+        /** Docker-network backing for VPCs and subnets. */
+        VpcNetworksConfig vpcNetworks();
+    }
+
+    /**
+     * Backs each VPC with a real Docker network so instances get private addresses drawn from
+     * the CIDR the caller declared, and instances in different VPCs cannot route to each other.
+     */
+    interface VpcNetworksConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * Private range that substituted CIDRs are allocated from, used when a declared VPC CIDR
+         * is absent, malformed, outside RFC 1918, or already claimed on the Docker daemon. Must
+         * itself be RFC 1918. The default sits high in 10/8, away from both Docker's default
+         * pools (172.17-172.31, 192.168) and the low 10.x ranges corporate VPNs favour.
+         */
+        @WithDefault("10.240.0.0/12")
+        String fallbackPool();
+
+        /** Prefix length of each block handed out of {@link #fallbackPool}. */
+        @WithDefault("16")
+        int fallbackPrefixLength();
+
+        /**
+         * When true, VPC networks left behind by a previous run of this same Floci instance are
+         * removed at startup. Scoped by the emulator's API port, so instances sharing a Docker
+         * daemon never reconcile each other's networks.
+         */
+        @WithDefault("true")
+        boolean reconcileOnStartup();
+
+        /** Docker network driver for VPC networks. */
+        @WithDefault("bridge")
+        String driver();
     }
 
     interface AppConfigServiceConfig {
@@ -2139,6 +2381,25 @@ public interface EmulatorConfig {
     interface PipesServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        KafkaRestBridgeConfig kafkaRestBridge();
+    }
+
+    /**
+     * The Karapace sidecar Pipes launches, on demand, to poll a Kafka source over REST instead of
+     * embedding kafka-clients in Floci itself. One container is started per distinct target
+     * {@code bootstrap.servers} (a self-managed cluster, or an MSK cluster's Redpanda backing), and
+     * reused across pipes that share the same source.
+     */
+    interface KafkaRestBridgeConfig {
+        @WithDefault("ghcr.io/aiven-open/karapace:latest")
+        String defaultImage();
+
+        @WithDefault("9500")
+        int hostPortBase();
+
+        @WithDefault("9599")
+        int hostPortMax();
     }
 
     interface BedrockAgentCoreControlServiceConfig {
@@ -2265,7 +2526,9 @@ public interface EmulatorConfig {
         String defaultPostgresImage();
 
         /** Airflow versions environments may request. Combined with the image tag
-         *  {@code apache/airflow:<version>-python3.12}. */
+         *  {@code apache/airflow:<version>-<pythonTag>}, where the Python tag matches the
+         *  version real Amazon MWAA runs for that Airflow version: see
+         *  {@code MwaaEnvironmentManager.pythonTagFor}. */
         @WithDefault("2.10.5,2.9.3,2.8.4")
         List<String> supportedVersions();
 

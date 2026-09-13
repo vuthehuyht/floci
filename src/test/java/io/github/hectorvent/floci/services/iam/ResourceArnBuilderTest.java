@@ -71,6 +71,29 @@ class ResourceArnBuilderTest {
         assertEquals("arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable", arn);
     }
 
+    /**
+     * Pass-through used to be a {@code startsWith("arn:aws:dynamodb:")} probe, so a table ARN from
+     * any other partition was not recognised as an ARN at all and got rebuilt as
+     * {@code table/arn:aws-cn:dynamodb:...}, a resource name that matches no policy.
+     */
+    @Test
+    void dynamoDbReturnsExactArnForAnyPartition() {
+        for (String fullArn : List.of(
+                "arn:aws-us-gov:dynamodb:us-gov-west-1:000000000000:table/FgacTable",
+                "arn:aws-cn:dynamodb:cn-north-1:000000000000:table/FgacTable")) {
+            setJsonBody("{\"TableName\":\"" + fullArn + "\"}");
+            assertEquals(fullArn, builder.build("dynamodb", ctx, "us-east-1", "000000000000"));
+        }
+    }
+
+    /** A bare name that merely looks ARN-ish is still a name, not an ARN. */
+    @Test
+    void dynamoDbTreatsAnIncompleteArnAsATableName() {
+        setJsonBody("{\"TableName\":\"arn:aws:dynamodb:us-east-1\"}");
+        assertEquals("arn:aws:dynamodb:us-east-1:000000000000:table/arn:aws:dynamodb:us-east-1",
+                builder.build("dynamodb", ctx, "us-east-1", "000000000000"));
+    }
+
     @Test
     void dynamoDbReturnsExactArnIfTableNameIsAlreadyArn() {
         String fullArn = "arn:aws:dynamodb:us-east-1:000000000000:table/FgacTable";
@@ -194,6 +217,13 @@ class ResourceArnBuilderTest {
                 "arn:aws:dynamodb:us-east-1:000000000000:table/TableA",
                 "arn:aws:dynamodb:us-east-1:000000000000:table/TableB"
         ), arns);
+    }
+
+    @Test
+    void dynamoDbBuildsArnFromTableCreationParameters() {
+        setJsonBody("{\"TableCreationParameters\":{\"TableName\":\"ImportTarget\"},\"InputFormat\":\"DYNAMODB_JSON\"}");
+        var arn = builder.build("dynamodb", ctx, "us-east-1", "000000000000");
+        assertEquals("arn:aws:dynamodb:us-east-1:000000000000:table/ImportTarget", arn);
     }
 
     @Test

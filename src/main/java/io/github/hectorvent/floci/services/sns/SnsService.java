@@ -223,6 +223,10 @@ public class SnsService implements Resettable, ResourceProvider {
         return topicStore.scan(k -> k.startsWith(prefix));
     }
 
+    public boolean topicExists(String topicArn, String region) {
+        return topicStore.get(topicKey(region, topicArn)).isPresent();
+    }
+
     public Map<String, String> getTopicAttributes(String topicArn, String region) {
         String key = topicKey(region, topicArn);
         Topic topic = topicStore.get(key)
@@ -431,7 +435,8 @@ public class SnsService implements Resettable, ResourceProvider {
             if (dedupId == null && "true".equals(topic.getAttributes().get("ContentBasedDeduplication"))) {
                 dedupId = sha256(message);
             }
-            if (dedupId != null && isDuplicate(effectiveArn, dedupId)) {
+            if (dedupId != null && isDuplicate(effectiveArn, messageGroupId, dedupId,
+                    isGroupScopedDeduplication(topic))) {
                 LOG.debugv("FIFO dedup: skipping duplicate for topic {0}, dedupId {1}", effectiveArn, dedupId);
                 return UUID.randomUUID().toString();
             }
@@ -837,6 +842,7 @@ public class SnsService implements Resettable, ResourceProvider {
         }
 
         boolean isFifo = "true".equals(topic.getAttributes().get("FifoTopic"));
+        boolean groupScopedDedup = isGroupScopedDeduplication(topic);
         List<String[]> successful = new ArrayList<>();
         List<String[]> failed = new ArrayList<>();
         for (Map<String, Object> entry : entries) {
@@ -867,7 +873,8 @@ public class SnsService implements Resettable, ResourceProvider {
             if (isFifo && messageDeduplicationId == null && "true".equals(topic.getAttributes().get("ContentBasedDeduplication"))) {
                 messageDeduplicationId = sha256(message);
             }
-            if (isFifo && messageDeduplicationId != null && isDuplicate(topicArn, messageDeduplicationId)) {
+            if (isFifo && messageDeduplicationId != null && isDuplicate(topicArn, messageGroupId,
+                    messageDeduplicationId, groupScopedDedup)) {
                 successful.add(new String[]{id, UUID.randomUUID().toString()});
                 continue;
             }
@@ -1248,8 +1255,23 @@ public class SnsService implements Resettable, ResourceProvider {
         return true;
     }
 
-    private boolean isDuplicate(String topicArn, String deduplicationId) {
-        String cacheKey = topicArn + ":" + deduplicationId;
+    /**
+     * {@code MessageGroup} narrows deduplication to a single message group. {@code Topic}, the AWS
+     * default, keeps it topic-wide.
+     */
+    private static boolean isGroupScopedDeduplication(Topic topic) {
+        return "MessageGroup".equalsIgnoreCase(topic.getAttributes().get("FifoThroughputScope"));
+    }
+
+    private boolean isDuplicate(String topicArn, String messageGroupId, String deduplicationId,
+                                boolean groupScoped) {
+        // The scope is part of the key: the attribute can change inside the deduplication window,
+        // and a topic-scoped id must never land on a group-scoped entry. The group is
+        // length-prefixed because nothing validates the characters in either id.
+        String scopedId = groupScoped
+                ? "group:" + messageGroupId.length() + ":" + messageGroupId + deduplicationId
+                : "topic:" + deduplicationId;
+        String cacheKey = topicArn + ":" + scopedId;
         Instant now = Instant.now();
         Instant existing = fifoDeduplicationCache.get(cacheKey);
         if (existing != null && existing.plus(FIFO_DEDUP_WINDOW).isAfter(now)) {
@@ -1464,13 +1486,31 @@ public class SnsService implements Resettable, ResourceProvider {
         }
     }
 
-    private static String extractFunctionName(String functionArn) {
-        int idx = functionArn.lastIndexOf(':');
-        return idx >= 0 ? functionArn.substring(idx + 1) : functionArn;
+    private static final String FUNCTION_MARKER = ":function:";
+
+    /**
+     * Function name out of a Lambda ARN, which may carry a qualifier:
+     * {@code arn:aws:lambda:<region>:<account>:function:<name>[:<alias-or-version>]}.
+     *
+     * <p>Taking the segment after the last colon reads the qualifier as the function name, so a
+     * subscription to {@code ...:function:order-processor:PROD} invoked a function called
+     * {@code PROD} and the message went nowhere. Cut after {@code :function:} instead, matching
+     * what S3 and Step Functions already do for the same ARN.
+     */
+    static String extractFunctionName(String functionArn) {
+        if (functionArn == null) {
+            return null;
+        }
+        int functionMarker = functionArn.indexOf(FUNCTION_MARKER);
+        if (functionMarker < 0) {
+            return functionArn;
+        }
+        String suffix = functionArn.substring(functionMarker + FUNCTION_MARKER.length());
+        int qualifierSeparator = suffix.indexOf(':');
+        return qualifierSeparator >= 0 ? suffix.substring(0, qualifierSeparator) : suffix;
     }
 
     private static String extractRegionFromArn(String arn) {
-        if (arn == null || !arn.startsWith("arn:aws:")) return null;
         return AwsArnUtils.regionOrDefault(arn, null);
     }
 

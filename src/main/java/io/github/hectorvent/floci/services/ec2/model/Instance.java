@@ -57,9 +57,21 @@ public class Instance {
     private boolean disableApiStop = false;
     private boolean disableApiTermination = false;
 
+    // Null for an instance persisted before metadata options were stored; reads fall back to
+    // AWS's launch defaults through effectiveMetadataOptions().
+    private LaunchTemplateData.MetadataOptions metadataOptions;
+
     // Docker backing fields (not serialised to AWS wire format)
     private String dockerContainerId;
     private String containerBridgeIp;
+    /**
+     * The container's default-bridge address, kept alongside {@code containerBridgeIp} when the
+     * instance is also attached to its VPC's Docker network. IMDS identifies a caller by the
+     * source address of its request, and that is whichever interface carries the container's
+     * default route, the bridge, while the address Floci reports is the VPC one. Both are
+     * registered so metadata answers either way.
+     */
+    private String imdsSourceIp;
     private String userData;
     private int sshHostPort;
     private long terminatedAt;
@@ -183,6 +195,9 @@ public class Instance {
     public String getContainerBridgeIp() { return containerBridgeIp; }
     public void setContainerBridgeIp(String containerBridgeIp) { this.containerBridgeIp = containerBridgeIp; }
 
+    public String getImdsSourceIp() { return imdsSourceIp; }
+    public void setImdsSourceIp(String imdsSourceIp) { this.imdsSourceIp = imdsSourceIp; }
+
     public Map<Integer, Integer> getPublishedPorts() {
         if (publishedPorts == null) {
             publishedPorts = new LinkedHashMap<>();
@@ -199,4 +214,12 @@ public class Instance {
 
     public boolean isDisableApiTermination() { return disableApiTermination; }
     public void setDisableApiTermination(boolean disableApiTermination) { this.disableApiTermination = disableApiTermination; }
+
+    public LaunchTemplateData.MetadataOptions getMetadataOptions() { return metadataOptions; }
+    public void setMetadataOptions(LaunchTemplateData.MetadataOptions metadataOptions) { this.metadataOptions = metadataOptions; }
+
+    /** The stored metadata options, or AWS's launch defaults for a record that has none. */
+    public LaunchTemplateData.MetadataOptions effectiveMetadataOptions() {
+        return metadataOptions != null ? metadataOptions : LaunchTemplateData.MetadataOptions.launchDefaults();
+    }
 }

@@ -15,9 +15,12 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Base64;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -535,7 +538,7 @@ class LambdaServiceTest {
     }
 
     @Test
-    void createFunctionWithMissingHandler() throws Exception {
+    void createFunctionDoesNotValidateHandlerAtDeployTime() throws Exception {
         Map<String, Object> req = new java.util.HashMap<>(Map.of(
                 "FunctionName", "missing-handler-fn",
                 "Runtime", "nodejs20.x",
@@ -543,22 +546,24 @@ class LambdaServiceTest {
                 "Handler", "src/index.handler",
                 "Code", Map.of("ZipFile", createZipBase64("other.js"))
         ));
-        AwsException ex = assertThrows(AwsException.class, () -> service.createFunction(REGION, req));
-        assertEquals("InvalidParameterValueException", ex.getErrorCode());
+        LambdaFunction fn = service.createFunction(REGION, req);
+        assertEquals("src/index.handler", fn.getHandler());
     }
 
     @Test
-    void createFunctionWithMissingNestedPythonModuleHandler() throws Exception {
+    void updateFunctionCodeDoesNotValidateHandlerAtDeployTime() throws Exception {
         Map<String, Object> req = new java.util.HashMap<>(Map.of(
                 "FunctionName", "missing-nested-python-handler-fn",
                 "Runtime", "python3.11",
                 "Role", "arn:aws:iam::000000000000:role/test-role",
                 "Handler", "apps.foo.src.lambda_handler.lambda_handler",
-                "Code", Map.of("ZipFile", createZipBase64("apps/foo/src/other.py"))
+                "Code", Map.of("ZipFile", createZipBase64("apps/foo/src/lambda_handler.py"))
         ));
-        AwsException ex = assertThrows(AwsException.class, () -> service.createFunction(REGION, req));
-        assertEquals("InvalidParameterValueException", ex.getErrorCode());
-        assertTrue(ex.getMessage().contains("apps/foo/src/lambda_handler"));
+        service.createFunction(REGION, req);
+
+        LambdaFunction fn = service.updateFunctionCode(REGION, "missing-nested-python-handler-fn",
+                Map.of("ZipFile", createZipBase64("apps/foo/src/other.py")));
+        assertEquals("apps.foo.src.lambda_handler.lambda_handler", fn.getHandler());
     }
 
     @Test
@@ -871,6 +876,11 @@ class LambdaServiceTest {
     // ──────────────────────────── Hot-reload ────────────────────────────
 
     private LambdaService serviceWithHotReload(boolean enabled, List<String> allowedPaths) {
+        return serviceWithHotReload(enabled, allowedPaths, ZipExtractor.DEFAULT_MAX_ENTRIES);
+    }
+
+    private LambdaService serviceWithHotReload(boolean enabled, List<String> allowedPaths,
+                                               int zipMaxEntries) {
         EmulatorConfig cfg = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig svc = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.LambdaServiceConfig lambdaCfg = mock(EmulatorConfig.LambdaServiceConfig.class);
@@ -881,6 +891,7 @@ class LambdaServiceTest {
         when(lambdaCfg.hotReload()).thenReturn(hr);
         when(lambdaCfg.defaultTimeoutSeconds()).thenReturn(3);
         when(lambdaCfg.defaultMemoryMb()).thenReturn(128);
+        when(lambdaCfg.zipMaxEntries()).thenReturn(zipMaxEntries);
         when(hr.enabled()).thenReturn(enabled);
         when(hr.allowedPaths()).thenReturn(allowedPaths == null ? Optional.empty() : Optional.of(allowedPaths));
 
@@ -890,6 +901,32 @@ class LambdaServiceTest {
         ZipExtractor zipExtractor = new ZipExtractor();
         RegionResolver regionResolver = new RegionResolver(REGION, "000000000000");
         return new LambdaService(store, warmPool, codeStore, zipExtractor, cfg, regionResolver);
+    }
+
+    @Test
+    void createFunctionRejectsConfiguredZipEntryLimit() throws Exception {
+        LambdaService limited = serviceWithHotReload(true, null, 2);
+        Map<String, Object> request = baseRequest("zip-entry-limit");
+        request.put("Code", Map.of("ZipFile", createZipBase64("index.js", "one.js", "two.js")));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> limited.createFunction(REGION, request));
+
+        assertEquals("InvalidParameterValueException", error.getErrorCode());
+        assertTrue(error.getMessage().contains("more than the configured 2 entries"));
+    }
+
+    @Test
+    void createFunctionRejectsOversizedDirectZipUploadWithAwsError() {
+        Map<String, Object> request = baseRequest("oversized-zip");
+        byte[] oversized = new byte[(int) ZipExtractor.DIRECT_UPLOAD_MAX_COMPRESSED_BYTES + 1];
+        request.put("Code", Map.of("ZipFile", Base64.getEncoder().encodeToString(oversized)));
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createFunction(REGION, request));
+
+        assertEquals("RequestEntityTooLargeException", error.getErrorCode());
+        assertEquals(413, error.getHttpStatus());
     }
 
     @Test
@@ -1434,5 +1471,173 @@ class LambdaServiceTest {
         assertThrows(AwsException.class, () -> service.updateEventSourceMapping(esm.getUuid(), Map.of(
                 "FunctionName", "arn:aws:lambda:us-west-2:000000000000:function:other-region-fn"
         )));
+    }
+
+    @Test
+    void functionExists_resolvesQualifiersAndRegions() {
+        service.createFunction(REGION, baseRequest("exists-fn"));
+        service.publishVersion(REGION, "exists-fn", null);
+
+        assertTrue(service.functionExists(REGION, "exists-fn"));
+        assertTrue(service.functionExists(REGION,
+                "arn:aws:lambda:us-east-1:000000000000:function:exists-fn"));
+        assertTrue(service.functionExists(REGION,
+                "arn:aws:lambda:us-east-1:000000000000:function:exists-fn:1"));
+
+        assertFalse(service.functionExists(REGION, "ghost-fn"));
+        // A qualified reference to a version that was never published must not pass just
+        // because the base function exists.
+        assertFalse(service.functionExists(REGION,
+                "arn:aws:lambda:us-east-1:000000000000:function:exists-fn:5"));
+        // An ARN whose region disagrees with the request region does not resolve.
+        assertFalse(service.functionExists(REGION,
+                "arn:aws:lambda:eu-west-1:000000000000:function:exists-fn"));
+    }
+
+    /**
+     * Issue #2958: a published version stored a reference to {@code $LATEST}'s code directory
+     * rather than a copy of the code, and extraction replaces that directory wholesale on every
+     * deploy. A later UpdateFunctionCode therefore rewrote what an already-published version would
+     * run, leaving the version advertising one CodeSha256 over a different build.
+     */
+    @Test
+    void aPublishedVersionKeepsItsOwnCodeWhenLatestIsRedeployed() throws Exception {
+        Map<String, Object> request = baseRequest("version-code-isolation-fn");
+        request.put("Code", Map.of("ZipFile", zipWithBody("v1")));
+        service.createFunction(REGION, request);
+
+        LambdaFunction v1 = service.publishVersion(REGION, "version-code-isolation-fn", null);
+        Path v1Path = Path.of(v1.getCodeLocalPath());
+        String v1Sha = v1.getCodeSha256();
+
+        assertTrue(Files.isDirectory(v1Path), "a published version must have its own code directory");
+        assertEquals("v1", Files.readString(v1Path.resolve("index.js")).trim());
+
+        // Redeploy $LATEST. Extraction replaces its directory wholesale, which is what used to take
+        // the published version's code with it.
+        service.updateFunctionCode(REGION, "version-code-isolation-fn",
+                Map.of("ZipFile", zipWithBody("v2")));
+
+        LambdaFunction latest = service.getFunction(REGION, "version-code-isolation-fn");
+        assertNotEquals(v1Path.toString(), latest.getCodeLocalPath(),
+                "a version must not share $LATEST's directory");
+        assertEquals("v2",
+                Files.readString(Path.of(latest.getCodeLocalPath()).resolve("index.js")).trim());
+
+        // The version still holds the bytes it was published from, and they still match the hash it
+        // advertises, which is the guarantee that was broken.
+        assertTrue(Files.isDirectory(v1Path), "the version's code must survive a redeploy of $LATEST");
+        assertEquals("v1", Files.readString(v1Path.resolve("index.js")).trim());
+        assertEquals(v1Sha, v1.getCodeSha256());
+    }
+
+    @Test
+    void deletingAFunctionRemovesItsPublishedVersionsCode() throws Exception {
+        Map<String, Object> request = baseRequest("version-code-delete-fn");
+        request.put("Code", Map.of("ZipFile", zipWithBody("v1")));
+        service.createFunction(REGION, request);
+
+        LambdaFunction v1 = service.publishVersion(REGION, "version-code-delete-fn", null);
+        Path v1Path = Path.of(v1.getCodeLocalPath());
+        assertTrue(Files.isDirectory(v1Path));
+
+        service.deleteFunction(REGION, "version-code-delete-fn");
+
+        assertFalse(Files.exists(v1Path),
+                "a version's code must not outlive the function it belongs to");
+    }
+
+    @Test
+    void deletingOnePublishedVersionReclaimsOnlyThatVersionsCode() throws Exception {
+        Map<String, Object> request = baseRequest("version-code-reclaim-fn");
+        request.put("Code", Map.of("ZipFile", zipWithBody("v1")));
+        service.createFunction(REGION, request);
+
+        LambdaFunction v1 = service.publishVersion(REGION, "version-code-reclaim-fn", null);
+        service.updateFunctionCode(REGION, "version-code-reclaim-fn",
+                Map.of("ZipFile", zipWithBody("v2")));
+        LambdaFunction v2 = service.publishVersion(REGION, "version-code-reclaim-fn", null);
+
+        Path v1Path = Path.of(v1.getCodeLocalPath());
+        Path v2Path = Path.of(v2.getCodeLocalPath());
+        Path latestPath = Path.of(
+                service.getFunction(REGION, "version-code-reclaim-fn").getCodeLocalPath());
+        assertNotEquals(v1Path, v2Path, "two versions must not share one code directory");
+
+        service.deleteFunction(REGION, "version-code-reclaim-fn", v1.getVersion());
+
+        // Only whole-function delete reclaimed any of this before, so every version ever published
+        // stayed on disk for as long as the data directory lived.
+        assertFalse(Files.exists(v1Path), "the deleted version's code must be reclaimed");
+        assertTrue(Files.isDirectory(v2Path), "a surviving version's code must be left alone");
+        assertEquals("v2", Files.readString(v2Path.resolve("index.js")).trim());
+        assertTrue(Files.isDirectory(latestPath), "$LATEST's code must be left alone");
+    }
+
+    private static String zipWithBody(String body) throws Exception {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            zos.putNextEntry(new ZipEntry("index.js"));
+            zos.write((body + "\n").getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+        }
+        return Base64.getEncoder().encodeToString(baos.toByteArray());
+    }
+
+    @Test
+    void updateFunctionCodeWaitsForAConcurrentHolderOfTheFunctionsConcurrencyLock() throws Exception {
+        assertUpdaterWaitsForTheLock("update-code-lock-fn",
+                (service, name) -> service.updateFunctionCode(REGION, name,
+                        new HashMap<>(Map.of("ImageUri", "public.ecr.aws/x/y:1"))));
+    }
+
+    @Test
+    void updateFunctionConfigurationWaitsForAConcurrentHolderOfTheFunctionsConcurrencyLock() throws Exception {
+        assertUpdaterWaitsForTheLock("update-config-lock-fn",
+                (service, name) -> service.updateFunctionConfiguration(REGION, name,
+                        new HashMap<>(Map.of("Timeout", 42))));
+    }
+
+    /**
+     * publishVersion copies roughly thirty fields off the live function inside this lock. Neither
+     * updater used to take it, so nothing was serialised and a snapshot could be part old code and
+     * part new configuration (issue #3007). Proving each updater blocks on the lock closes that
+     * window regardless of the exact interleaving, rather than relying on timing to catch it.
+     */
+    private void assertUpdaterWaitsForTheLock(
+            String functionName,
+            java.util.function.BiFunction<LambdaService, String, LambdaFunction> updater) throws Exception {
+        LambdaFunction fn = service.createFunction(REGION, baseRequest(functionName));
+        Object lock = service.lockForConcurrencyOp(fn.getFunctionArn());
+
+        ExecutorService pool = Executors.newFixedThreadPool(1);
+        CountDownLatch acquired = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (lock) {
+                acquired.countDown();
+                try {
+                    release.await();
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        });
+        try {
+            holder.start();
+            assertTrue(acquired.await(2, java.util.concurrent.TimeUnit.SECONDS));
+
+            Future<LambdaFunction> updateFuture = pool.submit(() -> updater.apply(service, functionName));
+            assertThrows(java.util.concurrent.TimeoutException.class,
+                    () -> updateFuture.get(200, java.util.concurrent.TimeUnit.MILLISECONDS),
+                    "the updater must block while another operation holds this function's lock");
+
+            release.countDown();
+            holder.join();
+            assertNotNull(updateFuture.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        } finally {
+            release.countDown();
+            pool.shutdownNow();
+        }
     }
 }

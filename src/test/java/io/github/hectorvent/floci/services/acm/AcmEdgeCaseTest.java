@@ -320,6 +320,49 @@ class AcmEdgeCaseTest {
             .body("__type", equalTo("ValidationException"));
     }
 
+    @Test
+    void emailValidationReportsValidationEmailsInsteadOfAResourceRecord() {
+        // Issue #3252
+        String certificateArn = given()
+            .header("X-Amz-Target", "CertificateManager.RequestCertificate")
+            .contentType(ACM_CONTENT_TYPE)
+            .body("""
+                {
+                    "DomainName": "probe.email.example.com",
+                    "ValidationMethod": "EMAIL",
+                    "DomainValidationOptions": [
+                        {"DomainName": "probe.email.example.com", "ValidationDomain": "email.example.com"}
+                    ]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().jsonPath().getString("CertificateArn");
+
+        given()
+            .header("X-Amz-Target", "CertificateManager.DescribeCertificate")
+            .contentType(ACM_CONTENT_TYPE)
+            .body("""
+                {
+                    "CertificateArn": "%s"
+                }
+                """.formatted(certificateArn))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Certificate.DomainValidationOptions", hasSize(1))
+            .body("Certificate.DomainValidationOptions[0].DomainName", equalTo("probe.email.example.com"))
+            .body("Certificate.DomainValidationOptions[0].ValidationDomain", equalTo("email.example.com"))
+            .body("Certificate.DomainValidationOptions[0].ValidationMethod", equalTo("EMAIL"))
+            .body("Certificate.DomainValidationOptions[0].ValidationEmails", contains(
+                "admin@email.example.com", "administrator@email.example.com", "hostmaster@email.example.com",
+                "postmaster@email.example.com", "webmaster@email.example.com"))
+            .body("Certificate.DomainValidationOptions[0]", not(hasKey("ResourceRecord")));
+    }
+
     // ==================== Domain Name Validation Tests ====================
 
     @Test
@@ -398,8 +441,8 @@ class AcmEdgeCaseTest {
     // ==================== Key Algorithm Tests ====================
 
     @Test
-    void allKeyAlgorithmsSupported() {
-        String[] algorithms = {"RSA_2048", "RSA_3072", "RSA_4096", "EC_prime256v1", "EC_secp384r1", "EC_secp521r1"};
+    void requestableKeyAlgorithmsAccepted() {
+        String[] algorithms = {"RSA_2048", "EC_prime256v1", "EC_secp384r1"};
 
         for (String algo : algorithms) {
             given()
@@ -416,6 +459,35 @@ class AcmEdgeCaseTest {
             .then()
                 .statusCode(200)
                 .body("CertificateArn", startsWith("arn:aws:acm:"));
+        }
+    }
+
+    @Test
+    void unsupportedKeyAlgorithmsRejected() {
+        // Real ACM rejects these on RequestCertificate. The RSA_4096 message carries the
+        // account id where the region goes, an AWS quirk replicated verbatim.
+        Map<String, String> expected = Map.of(
+            "RSA_1024", "Encryption Algorithm RSA_1024 is not supported in us-east-1 region",
+            "RSA_3072", "Encryption Algorithm RSA_3072 is not supported in us-east-1 region",
+            "RSA_4096", "Encryption Algorithm RSA_4096 is not supported in 000000000000 region",
+            "EC_secp521r1", "Encryption Algorithm EC_secp521r1 is not supported in us-east-1 region");
+
+        for (Map.Entry<String, String> entry : expected.entrySet()) {
+            given()
+                .header("X-Amz-Target", "CertificateManager.RequestCertificate")
+                .contentType(ACM_CONTENT_TYPE)
+                .body("""
+                    {
+                        "DomainName": "%s.example.com",
+                        "KeyAlgorithm": "%s"
+                    }
+                    """.formatted(entry.getKey().toLowerCase().replace("_", "-"), entry.getKey()))
+            .when()
+                .post("/")
+            .then()
+                .statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo(entry.getValue()));
         }
     }
 }

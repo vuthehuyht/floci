@@ -8,7 +8,7 @@ Floci supports optional TLS, enabling `https://` for all REST/JSON/Query endpoin
 docker run -e FLOCI_TLS_ENABLED=true -p 4566:4566 floci/floci:latest
 ```
 
-Then point your SDK at `https://localhost:4566` and trust Floci's local CA in the processes that talk to it. Every certificate Floci issues (its HTTPS endpoint, every ACM certificate and, in a later release, IoT device certificates) chains to that one CA:
+Then point your SDK at `https://localhost:4566` and trust Floci's local CA in the processes that talk to it. Every certificate Floci issues (its HTTPS endpoint, every ACM certificate and every IoT device certificate) chains to that one CA:
 
 ```bash
 curl -s http://localhost:4566/_floci/ca.pem -o floci-root-ca.pem
@@ -58,7 +58,7 @@ When `FLOCI_TLS_ENABLED=true` and no custom certificate is provided, Floci keeps
 - Includes `localhost`, `127.0.0.1`, `0.0.0.0`, `*.localhost`, `localhost.floci.io`,
   `*.localhost.floci.io`, `*.execute-api.localhost.floci.io`, and
   `*.execute-api.localhost.localstack.cloud` as Subject Alternative Names (SANs)
-- Automatically includes custom hostnames from `FLOCI_HOSTNAME` and `FLOCI_BASE_URL` in the SANs
+- Automatically includes custom hostnames from `FLOCI_HOSTNAME`, `FLOCI_BASE_URL` and `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS` in the SANs
 - Is regenerated when hostname configuration changes between restarts, or when it was not issued by the current CA
 
 The CA is created once and never rotates on its own. If its files are missing, corrupt or do not match each other, Floci generates a new CA, logs a warning, and reissues the server certificate; clients then need the new `ca.pem`.
@@ -93,6 +93,10 @@ Only a name under a local suffix is accepted: `localhost`, `localhost.floci.io`,
 
 Names are added by the custom domain operations: API Gateway `CreateDomainName`, IoT Core `CreateDomainConfiguration` with a `domainName`, and Cognito `CreateUserPoolDomain` with a `CustomDomainConfig`. The AWS operation succeeds either way; a name outside the local suffixes, or a reissue that fails, is logged as a warning.
 
+### Containers Floci Launches
+
+Every container Floci launches, from Lambda functions and ECS or Batch tasks to the Docker backends behind RDS, ElastiCache, MWAA and Flink, and the Kubernetes Lambda pods, receives `/etc/floci-ca-bundle.pem`: the public root CAs the Floci JVM trusts, followed by the Floci CA (or your certificate file when you provide one). `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS` and `AWS_CA_BUNDLE` point at it, so curl, Python, Node.js, Go, the AWS CLI and the AWS SDKs that read `AWS_CA_BUNDLE` reach both Floci and public HTTPS sites with no setup in the workload. A variable you set on the function or task definition wins over the injected one. The JVM ignores all of these variables, so a Java workload still needs its own trust store, as shown under SDK Configuration Examples. The bundle is written to `{persistent-path}/tls/floci-ca-bundle.pem` at startup; when it is missing, or when an image has no `/etc` to copy it into, the container starts without the variables and Floci logs a warning.
+
 ## User-Provided Certificates
 
 To use your own certificate (e.g., from a corporate CA or mkcert):
@@ -107,7 +111,7 @@ docker run \
   floci/floci:latest
 ```
 
-When custom certificate paths are provided, `FLOCI_TLS_SELF_SIGNED` is ignored and the HTTPS server uses your certificate; no server certificate is generated. `GET /_floci/ca.pem` then returns a PEM bundle: your certificate file first, then Floci's local CA, which is created on first use and is the CA that will sign the certificates Floci itself issues (IoT device certificates, in a follow-up). Put the CA or the full chain in your certificate file if clients fetch their trust anchor from Floci; a bare leaf only lets them pin that one certificate.
+When custom certificate paths are provided, `FLOCI_TLS_SELF_SIGNED` is ignored and the HTTPS server uses your certificate; no server certificate is generated. `GET /_floci/ca.pem` then returns a PEM bundle: the certificates in your certificate file first (a private key kept in that file is never served), then Floci's local CA, which is created on first use and signs the certificates Floci itself issues (IoT device certificates). Put the CA or the full chain in your certificate file if clients fetch their trust anchor from Floci; a bare leaf only lets them pin that one certificate.
 
 ## WebSocket (wss://)
 
@@ -118,6 +122,10 @@ wss://localhost:4566/ws/{apiId}/{stage}
 ```
 
 No additional configuration is needed: Vert.x handles TLS at the transport layer transparently.
+
+## MQTT over TLS (8883)
+
+When TLS is enabled, the IoT MQTT broker also listens on port 8883 with the same certificate as the HTTPS endpoint, hostnames learned at runtime included. Devices connect with `ssl://` trusting `ca.pem`; see [IoT Core](../services/iot.md#mqtt-over-tls). Devices that take the hostname from `DescribeEndpoint` and add their own port need `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS`, see [Endpoint address](../services/iot.md#endpoint-address).
 
 ## SDK Configuration Examples
 

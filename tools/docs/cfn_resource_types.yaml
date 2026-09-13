@@ -38,6 +38,7 @@ order:
   - AWS::CertificateManager
   - AWS::Events
   - AWS::Scheduler
+  - AWS::Backup
   - AWS::Pipes
   - AWS::Kinesis
   - AWS::KinesisFirehose
@@ -48,6 +49,7 @@ order:
   - AWS::WAFv2
   - AWS::Config
   - AWS::CloudFormation
+  - AWS::CloudTrail
   - Custom
   - AWS::CDK
 
@@ -99,10 +101,12 @@ service_labels:
   AWS::ApiGatewayV2: API Gateway v2
   AWS::AutoScaling: Auto Scaling
   AWS::Batch: Batch
+  AWS::Backup: Backup
   AWS::CDK: CDK
   AWS::CertificateManager: ACM
   AWS::CloudFormation: CloudFormation
   AWS::CloudFront: CloudFront
+  AWS::CloudTrail: CloudTrail
   AWS::CloudWatch: CloudWatch
   AWS::CodeBuild: CodeBuild
   AWS::CodePipeline: CodePipeline
@@ -150,6 +154,7 @@ notes:
   AWS::IoT::DomainConfiguration: '`ServerCertificates` resolves to a JSON string'
   AWS::IoT::Policy: 'deleted after detaching it from its principals; on AWS the delete fails with `DeleteConflictException` while the policy is attached'
   Custom::DynamoDBReplica: applied natively against DynamoDB, not via a provider Lambda
+  AWS::Cognito::UserPool: '`ProviderURL` is the local issuer of the tokens Floci mints, `<base-url>/<pool id>`'
 
 # Trailing prose appended to a row after its type list, for behaviour that belongs to the service
 # rather than to one type.

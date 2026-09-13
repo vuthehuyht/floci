@@ -14,6 +14,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Base64;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -60,9 +61,63 @@ class LambdaAccountScopedCodeTest {
 
         svcB.deleteFunction(REGION, "shared-fn");
 
-        assertTrue(sharedCodeStore.exists(ACCOUNT_A, "shared-fn"),
+        assertTrue(sharedCodeStore.exists(ACCOUNT_A, REGION, "shared-fn"),
                 "deleting B's function must not delete A's code");
         assertEquals("A", Files.readString(Path.of(a.getCodeLocalPath()).resolve("index.js")));
+    }
+
+    @Test
+    void sameFunctionNameInTwoRegionsKeepsItsOwnCodeOnDisk(@TempDir Path baseDir) throws Exception {
+        CodeStore sharedCodeStore = new CodeStore(baseDir);
+        LambdaService service = serviceFor(ACCOUNT_A, sharedCodeStore);
+
+        LambdaFunction east = service.createFunction(REGION, zipRequest("regional-fn", "east"));
+        LambdaFunction west = service.createFunction("eu-west-1", zipRequest("regional-fn", "west"));
+
+        assertNotEquals(east.getCodeLocalPath(), west.getCodeLocalPath());
+        assertEquals("east", Files.readString(Path.of(east.getCodeLocalPath()).resolve("index.js")));
+        assertEquals("west", Files.readString(Path.of(west.getCodeLocalPath()).resolve("index.js")));
+    }
+
+    @Test
+    void updateAndDeleteInOneRegionLeaveTheOtherRegionCodeIntact(@TempDir Path baseDir) throws Exception {
+        CodeStore sharedCodeStore = new CodeStore(baseDir);
+        LambdaService service = serviceFor(ACCOUNT_A, sharedCodeStore);
+        service.createFunction(REGION, zipRequest("regional-fn", "east-v1"));
+        LambdaFunction west = service.createFunction("eu-west-1", zipRequest("regional-fn", "west-v1"));
+
+        service.updateFunctionCode(REGION, "regional-fn", Map.of("ZipFile", zipBase64("index.js", "east-v2")));
+
+        assertEquals("west-v1", Files.readString(Path.of(west.getCodeLocalPath()).resolve("index.js")));
+        service.deleteFunction(REGION, "regional-fn");
+        assertTrue(sharedCodeStore.exists(ACCOUNT_A, "eu-west-1", "regional-fn"));
+        assertEquals("west-v1", Files.readString(Path.of(west.getCodeLocalPath()).resolve("index.js")));
+    }
+
+    @Test
+    void regionScopedCodeSurvivesAStoreRestart(@TempDir Path baseDir) throws Exception {
+        LambdaService first = serviceFor(ACCOUNT_A, new CodeStore(baseDir));
+        LambdaFunction created = first.createFunction("ap-southeast-2", zipRequest("restart-fn", "persisted"));
+
+        CodeStore afterRestart = new CodeStore(baseDir);
+        assertTrue(afterRestart.exists(ACCOUNT_A, "ap-southeast-2", "restart-fn"));
+        assertEquals("persisted", Files.readString(Path.of(created.getCodeLocalPath()).resolve("index.js")));
+    }
+
+    @Test
+    void concurrentExtractionInTwoRegionsDoesNotOverwriteCode(@TempDir Path baseDir) throws Exception {
+        CodeStore sharedCodeStore = new CodeStore(baseDir);
+        LambdaService service = serviceFor(ACCOUNT_A, sharedCodeStore);
+
+        CompletableFuture<LambdaFunction> east = CompletableFuture.supplyAsync(() -> createUnchecked(
+                service, REGION, "concurrent-fn", "east"));
+        CompletableFuture<LambdaFunction> west = CompletableFuture.supplyAsync(() -> createUnchecked(
+                service, "eu-west-1", "concurrent-fn", "west"));
+
+        LambdaFunction eastFunction = east.join();
+        LambdaFunction westFunction = west.join();
+        assertEquals("east", Files.readString(Path.of(eastFunction.getCodeLocalPath()).resolve("index.js")));
+        assertEquals("west", Files.readString(Path.of(westFunction.getCodeLocalPath()).resolve("index.js")));
     }
 
     @Test
@@ -110,14 +165,18 @@ class LambdaAccountScopedCodeTest {
     }
 
     @Test
-    void updateFunctionCodeDoesNotDeleteALegacyDirectoryStillReferencedByAPublishedVersion(
+    void aPublishedVersionsCodeSurvivesLatestMigratingOffTheLegacyPath(
             @TempDir Path baseDir) throws Exception {
-        // publishVersion snapshots codeLocalPath verbatim (it must, or a version-qualified
-        // invoke launches a container with no code - see #1987). If $LATEST was still on the
-        // legacy path at publish time, that version's snapshot is now the ONLY thing keeping
-        // the legacy directory alive once $LATEST itself migrates. The unused-check only scanned
-        // $LATEST records, so it missed this and reclaimed the directory out from under the
-        // published version's own future invokes.
+        // publishVersion used to snapshot codeLocalPath verbatim (it had to, or a
+        // version-qualified invoke launched a container with no code - see #1987). If $LATEST was
+        // still on the legacy path at publish time, that version's snapshot became the ONLY thing
+        // keeping the legacy directory alive once $LATEST itself migrated, and the unused-check
+        // reclaimed it out from under the version's own future invokes.
+        //
+        // A version now copies the code into a directory of its own (#2958), so it no longer
+        // depends on the legacy directory surviving. The guarantee this test protects is unchanged
+        // and now stronger: whatever happens to the directory $LATEST was using, the version keeps
+        // the code it was published from.
         CodeStore codeStore = new CodeStore(baseDir);
         LambdaService svc = serviceFor(ACCOUNT_A, codeStore);
         svc.createFunction(REGION, zipRequest("legacy-version-fn", "v1"));
@@ -129,13 +188,17 @@ class LambdaAccountScopedCodeTest {
         latest.setCodeLocalPath(legacyPath.toAbsolutePath().normalize().toString());
 
         LambdaFunction version = svc.publishVersion(REGION, "legacy-version-fn", null);
-        assertEquals(legacyPath.toAbsolutePath().normalize().toString(), version.getCodeLocalPath(),
-                "the published version must have snapshotted the legacy path");
+        Path versionPath = Path.of(version.getCodeLocalPath());
+        assertNotEquals(legacyPath.toAbsolutePath().normalize().toString(), version.getCodeLocalPath(),
+                "the published version must own its code rather than reference the legacy directory");
+        assertEquals("v1", Files.readString(versionPath.resolve("index.js")).trim());
 
         svc.updateFunctionCode(REGION, "legacy-version-fn", Map.of("ZipFile", zipBase64("index.js", "v2")));
 
-        assertTrue(Files.exists(legacyPath),
-                "a legacy directory a published version still references must survive this update");
+        assertTrue(Files.isDirectory(versionPath),
+                "the published version's own code must survive $LATEST migrating off the legacy path");
+        assertEquals("v1", Files.readString(versionPath.resolve("index.js")).trim(),
+                "the version must still hold the code it was published from");
     }
 
     @Test
@@ -195,6 +258,14 @@ class LambdaAccountScopedCodeTest {
         fn.setAccountId(accountId);
         fn.setFunctionName("shared-fn");
         return fn;
+    }
+
+    private LambdaFunction createUnchecked(LambdaService service, String region, String name, String source) {
+        try {
+            return service.createFunction(region, zipRequest(name, source));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private LambdaService serviceFor(String accountId, CodeStore codeStore) {

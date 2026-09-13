@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.lambda.model.InvocationType;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
 import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
 import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
@@ -80,7 +81,7 @@ class AslExecutorLambdaInvokeResultTest {
                 functionStore,
                 mock(DynamoDbService.class),
                 mock(DynamoDbJsonHandler.class),
-                mock(SqsJsonHandler.class),
+                mock(SqsJsonHandler.class), mock(SnsJsonHandler.class),
                 mock(io.github.hectorvent.floci.services.cloudformation.CloudFormationQueryHandler.class),
                 mock(io.github.hectorvent.floci.services.ec2.Ec2Service.class),
                 mock(S3Service.class),
@@ -168,6 +169,33 @@ class AslExecutorLambdaInvokeResultTest {
         assertEquals("RET", output.path("lambda").path("marker").asText());
         assertEquals(200, output.path("lambda").path("status").asInt());
         assertEquals(1, output.path("in").asInt());
+    }
+
+    @Test
+    void resultSelectorUnwrapsPayloadWhenFunctionNameIsABareName() throws Exception {
+        // Scenario (c) of issue #2544: the function is referenced by its bare name and the
+        // documented "$.Payload" selector must reach the function output, not resolve to null.
+        Execution execution = run("""
+                {
+                  "StartAt": "T",
+                  "States": {
+                    "T": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {"FunctionName": "%s", "Payload.$": "$"},
+                      "ResultSelector": {"unwrapped.$": "$.Payload"},
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(FUNCTION_NAME));
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        JsonNode output = objectMapper.readTree(execution.getOutput());
+        assertTrue(output.path("unwrapped").isObject(), "$.Payload must resolve to the function output");
+        assertEquals("RET", output.path("unwrapped").path("marker").asText());
+        assertEquals(1, output.path("unwrapped").path("echo").path("in").asInt());
+        assertEquals(1, output.size());
     }
 
     @Test

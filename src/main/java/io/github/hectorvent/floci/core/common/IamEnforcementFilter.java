@@ -20,6 +20,7 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.ext.Provider;
 import org.jboss.logging.Logger;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -172,6 +173,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         List<String> resources = arnBuilder.buildResources(credentialScope, ctx, region, accountId);
 
         Map<String, List<String>> conditionContext = conditionContextResolver.resolve(credentialScope, action, ctx);
+        // A request naming several resources is authorized once per resource, as on AWS, so a
+        // permitted first target cannot carry later targets that the policy does not allow.
+        List<Map<String, List<String>>> remainingTargets =
+                conditionContextResolver.resolveRemainingTargets(credentialScope, action, ctx);
 
         // aws:PrincipalArn is populated for every principal this filter can identify — IAM users,
         // assumed-role sessions, and now the synthesized account-root principal above, using AWS's
@@ -186,10 +191,20 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             conditionContext = conditionContext == null ? new HashMap<>() : new HashMap<>(conditionContext);
             conditionContext.put("aws:PrincipalArn", List.of(principalArn.get()));
         }
+        List<Map<String, List<String>>> targetContexts = new ArrayList<>();
+        targetContexts.add(conditionContext);
+        for (Map<String, List<String>> target : remainingTargets) {
+            Map<String, List<String>> targetContext = new HashMap<>(target);
+            principalArn.ifPresent(arn -> targetContext.put("aws:PrincipalArn", List.of(arn)));
+            targetContexts.add(targetContext);
+        }
 
         for (String resource : resources) {
-            Decision decision = evaluator.evaluate(caller, null, action, resource, conditionContext);
-            if (decision == Decision.DENY) {
+            for (Map<String, List<String>> targetContext : targetContexts) {
+                Decision decision = evaluator.evaluate(caller, null, action, resource, targetContext);
+                if (decision != Decision.DENY) {
+                    continue;
+                }
                 LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
                 String denyMessage = "User: arn:aws:iam::" + accountId
                         + ":user/" + akid + " is not authorized to perform: " + action
@@ -200,6 +215,76 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 return;
             }
         }
+    }
+
+    /**
+     * Authorizes a single (action, resource) pair for the caller identified by an
+     * Authorization header, following the same identity resolution and bypass rules
+     * as {@link #filter}. Callers use this for a secondary resource that never appears
+     * in the request URL and so is invisible to {@link ResourceArnBuilder} - such as
+     * the CopyObject/UploadPartCopy source object, which arrives only in the
+     * {@code x-amz-copy-source} header.
+     *
+     * <p>Returns normally when the action is allowed, or when enforcement does not
+     * apply to this request (enforcement disabled, no Authorization header, root or
+     * unknown access key). Throws {@link AwsException} with the same AccessDenied
+     * shape as {@link #filter} when the caller's policies deny the action.
+     */
+    public void authorizeAdditionalResource(String authorizationHeader, String action, String resource) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return;
+        }
+        if (authorizationHeader == null) {
+            return;
+        }
+        String akid = accountResolver.extractAccessKeyId(authorizationHeader);
+        if (akid == null || "test".equals(akid)) {
+            return;
+        }
+        if (extractCredentialScope(authorizationHeader) == null) {
+            return;
+        }
+
+        String accountId = requestContext.getAccountId() == null
+                ? accountResolver.resolve(authorizationHeader)
+                : requestContext.getAccountId();
+
+        List<List<String>> scpLevels = scpProvider.isResolvable()
+                ? scpProvider.get().effectiveScpLevels(accountId) : null;
+
+        boolean accountRootPrincipal = false;
+        CallerContext caller = iamService.resolveCallerContext(akid);
+        if (caller == null) {
+            if (scpLevels == null || !akid.equals(accountId)) {
+                return;
+            }
+            caller = CallerContext.of(List.of(ROOT_ALLOW_ALL));
+            accountRootPrincipal = true;
+        }
+        if (scpLevels != null) {
+            caller = caller.withScpLevels(scpLevels);
+        }
+
+        Map<String, List<String>> conditionContext = null;
+        Optional<String> principalArn = accountRootPrincipal
+                ? Optional.of("arn:aws:iam::" + accountId + ":root")
+                : iamService.resolveCallerArn(akid);
+        if (principalArn.isPresent()) {
+            conditionContext = new HashMap<>();
+            conditionContext.put("aws:PrincipalArn", List.of(principalArn.get()));
+        }
+
+        Decision decision = evaluator.evaluate(caller, null, action, resource, conditionContext);
+        if (decision != Decision.DENY) {
+            return;
+        }
+        LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
+        throw new AwsException("AccessDenied",
+                "User: arn:aws:iam::" + accountId + ":user/" + akid
+                        + " is not authorized to perform: " + action
+                        + " on resource: \"" + resource + "\""
+                        + " because no identity-based policy allows the " + action + " action",
+                403);
     }
 
     /**

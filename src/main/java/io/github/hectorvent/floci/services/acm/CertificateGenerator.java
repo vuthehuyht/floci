@@ -69,11 +69,13 @@ public class CertificateGenerator {
     private static final int PBE_ITERATIONS = 4096;
 
     /**
-     * Pattern matching IPv4 addresses (e.g. 192.168.1.100) and IPv6 addresses
-     * (bracketed like [::1] or raw like ::1, fe80::1).
+     * A dotted quad with every octet in range. Deliberately strict: a loose pattern lets a
+     * value like {@code 1234} reach {@link InetAddress#getByName}, which happily decodes it as
+     * {@code 0.0.4.210} and bakes a nonsense address into the certificate.
      */
-    private static final Pattern IP_ADDRESS_PATTERN = Pattern.compile(
-            "^\\[?([0-9a-fA-F:]+)]?$|^(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})$"
+    private static final Pattern IPV4_PATTERN = Pattern.compile(
+            "^(25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)"
+                    + "(\\.(25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)){3}$"
     );
 
     public record GeneratedCertificate(
@@ -125,11 +127,16 @@ public class CertificateGenerator {
      * every client in the emulator's reach accepts it and it keeps key generation under a second.
      */
     public GeneratedCertificate generateCaCertificate(String commonName) {
+        return generateCaCertificate(commonName, Instant.now().plus(3650, ChronoUnit.DAYS));
+    }
+
+    /** Same as {@link #generateCaCertificate(String)} with an explicit end of validity. */
+    public GeneratedCertificate generateCaCertificate(String commonName, Instant notAfter) {
         try {
             KeyPair keyPair = generateKeyPair(KeyAlgorithm.RSA_2048);
             X500Name dn = new X500Name("CN=" + commonName);
             X509Certificate cert = signCertificate(dn, keyPair.getPublic(), dn, keyPair.getPrivate(),
-                    List.of(), true, null, 3650);
+                    List.of(), true, null, Instant.now(), notAfter);
             return toGenerated(cert, keyPair.getPrivate(), dn.toString(), dn.toString());
         } catch (Exception e) {
             LOG.error("Failed to generate CA certificate", e);
@@ -149,6 +156,14 @@ public class CertificateGenerator {
     public GeneratedCertificate generateIssuedCertificate(String domainName, List<String> sans,
                                                           KeyAlgorithm keyAlgorithm, KeyPair subjectKeyPair,
                                                           Issuer issuer, LeafUsage usage) {
+        return generateIssuedCertificate(domainName, sans, keyAlgorithm, subjectKeyPair, issuer, usage,
+                Instant.now().plus(365, ChronoUnit.DAYS));
+    }
+
+    /** Same as {@link #generateIssuedCertificate(String, List, KeyAlgorithm, KeyPair, Issuer, LeafUsage)} with an explicit end of validity. */
+    public GeneratedCertificate generateIssuedCertificate(String domainName, List<String> sans,
+                                                          KeyAlgorithm keyAlgorithm, KeyPair subjectKeyPair,
+                                                          Issuer issuer, LeafUsage usage, Instant notAfter) {
         try {
             if (subjectKeyPair != null && !isOfAlgorithm(subjectKeyPair.getPublic(), keyAlgorithm)) {
                 throw new IllegalArgumentException("supplied key pair is not the requested " + keyAlgorithm);
@@ -160,7 +175,7 @@ public class CertificateGenerator {
             X500Name subject = new X500Name("CN=" + domainName);
             X500Name issuerDn = X500Name.getInstance(issuer.certificate().getSubjectX500Principal().getEncoded());
             X509Certificate cert = signCertificate(subject, keyPair.getPublic(), issuerDn, issuer.key(),
-                    withDomainFirst(domainName, sans), false, usage, 365);
+                    withDomainFirst(domainName, sans), false, usage, Instant.now(), notAfter);
             cert.verify(issuer.certificate().getPublicKey());
             return toGenerated(cert, keyPair.getPrivate(), subject.toString(),
                     issuer.certificate().getSubjectX500Principal().getName());
@@ -229,10 +244,17 @@ public class CertificateGenerator {
                                            PrivateKey issuerKey, List<String> sans, boolean asCa,
                                            LeafUsage usage, int validityDays) throws Exception {
         Instant now = Instant.now();
+        return signCertificate(subject, subjectKey, issuerDn, issuerKey, sans, asCa, usage, now,
+                now.plus(validityDays, ChronoUnit.DAYS));
+    }
+
+    /** Same as {@link #signCertificate(X500Name, PublicKey, X500Name, PrivateKey, List, boolean, LeafUsage, int)} with an explicit validity window. */
+    public X509Certificate signCertificate(X500Name subject, PublicKey subjectKey, X500Name issuerDn,
+                                           PrivateKey issuerKey, List<String> sans, boolean asCa,
+                                           LeafUsage usage, Instant notBefore, Instant notAfter) throws Exception {
         BigInteger serial = new BigInteger(128, SECURE_RANDOM);
         X509v3CertificateBuilder certBuilder = new JcaX509v3CertificateBuilder(
-                issuerDn, serial, Date.from(now), Date.from(now.plus(validityDays, ChronoUnit.DAYS)),
-                subject, subjectKey);
+                issuerDn, serial, Date.from(notBefore), Date.from(notAfter), subject, subjectKey);
 
         if (sans != null && !sans.isEmpty()) {
             List<GeneralName> sanList = new ArrayList<>();
@@ -322,15 +344,16 @@ public class CertificateGenerator {
     private static GeneralName toGeneralName(String san) {
         if (isIpAddress(san)) {
             try {
-                // Strip brackets from IPv6 if present (e.g. [::1] → ::1)
-                String raw = san.startsWith("[") && san.endsWith("]")
-                        ? san.substring(1, san.length() - 1)
-                        : san;
+                String raw = stripBrackets(san);
                 byte[] addr = InetAddress.getByName(raw).getAddress();
                 return new GeneralName(GeneralName.iPAddress,
                         new org.bouncycastle.asn1.DEROctetString(addr));
             } catch (Exception e) {
-                // Fallback to DNS name if IP parsing fails
+                // Only a malformed IPv6 literal reaches this: IPv4 is range-checked before it
+                // gets here, and a value only arrives with a colon and a literal-shaped first
+                // character, which the JDK rejects outright rather than resolving. Emitting it as a DNS
+                // name keeps the name covered; dropping it would silently stop the server
+                // serving that host, which fails a handshake with nothing to point at.
                 LOG.debugv("Could not parse '{0}' as IP address, treating as DNS name", san);
                 return new GeneralName(GeneralName.dNSName, san);
             }
@@ -339,14 +362,56 @@ public class CertificateGenerator {
     }
 
     /**
-     * Checks whether a SAN value looks like an IP address (IPv4 or IPv6).
-     * Wildcard entries (e.g. *.localhost) are never IP addresses.
+     * Whether a SAN value has the shape of an IP address literal. Wildcard entries are never
+     * IP addresses.
+     *
+     * <p>This has to match the set {@link InetAddress#getByName} parses as a literal rather than
+     * resolving, because anything outside that set is sent to the name service, and certificate
+     * generation must not make network calls. That set is narrower than "contains a colon":
+     * {@code getAllByName} only attempts a literal parse when the <em>first</em> character is an
+     * ASCII hex digit or a colon, and otherwise resolves. So {@code z:1} holds a colon and is
+     * still looked up.
+     *
+     * <p>Both halves of the colon test are load-bearing. Inside the JDK's literal branch a failed
+     * IPv6 parse only throws when the value contains a colon; without one it falls through to a
+     * lookup. So the value must both contain a colon and begin like a literal for the parse to be
+     * guaranteed to fail closed.
      */
     static boolean isIpAddress(String value) {
         if (value == null || value.isBlank() || value.startsWith("*")) {
             return false;
         }
-        return IP_ADDRESS_PATTERN.matcher(value).matches();
+        String raw = stripBrackets(value);
+        return IPV4_PATTERN.matcher(raw).matches()
+                || (raw.indexOf(':') >= 0 && startsLikeAnIpLiteral(raw.charAt(0)));
+    }
+
+    /**
+     * The JDK's own leading-character test for "try to parse this as a literal", spelled out
+     * rather than delegated.
+     *
+     * <p>Deliberately not {@code Character.digit(c, 16)}. {@code IPAddressUtil.digit} resolves to
+     * an ASCII-only parser unless {@code jdk.net.allowAmbiguousIPAddressLiterals} is set, and its
+     * own comment gives the accepted set as {@code [0-9,A-F,a-f]}. {@code Character.digit} is
+     * wider: it answers 1 for the Arabic-Indic digit one, so a value like {@code \u0661:1} would
+     * pass this check, be handed to the resolver, and be looked up after the JDK declined to read
+     * it as a literal.
+     *
+     * <p>Being stricter than the JDK is safe in both directions. If that property ever is set,
+     * this check simply routes the value to the dNSName fallback instead of the resolver.
+     */
+    private static boolean startsLikeAnIpLiteral(char first) {
+        return first == ':'
+                || (first >= '0' && first <= '9')
+                || (first >= 'a' && first <= 'f')
+                || (first >= 'A' && first <= 'F');
+    }
+
+    /** Unwraps the brackets an IPv6 literal may carry, e.g. {@code [::1]} to {@code ::1}. */
+    private static String stripBrackets(String value) {
+        return value.length() > 1 && value.startsWith("[") && value.endsWith("]")
+                ? value.substring(1, value.length() - 1)
+                : value;
     }
 
     /**

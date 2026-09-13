@@ -35,11 +35,23 @@ import java.util.Set;
  * trust the CA ({@code floci-root-ca.crt}, or {@code GET /_floci/ca.pem}), never the leaf.
  *
  * <p>
+ * It also writes {@link ContainerCaBundle}, the trust bundle every container Floci launches
+ * receives, next to the certificates.
+ *
+ * <p>
  * Both HTTP and HTTPS are served simultaneously (LocalStack parity).
  */
 public class TlsConfigSource implements ConfigSource {
 
     private static final Logger LOG = Logger.getLogger(TlsConfigSource.class);
+
+    /**
+     * Internal ports Quarkus binds when TLS is enabled. {@link TlsProxyServer} listens on the
+     * public Floci port and routes to these by protocol, so the two classes must agree; they are
+     * declared here, next to the properties that set them, and referenced from the proxy.
+     */
+    static final int HTTP_INTERNAL_PORT = 4510;
+    static final int HTTPS_INTERNAL_PORT = 4511;
 
     private static final String SERVER_CERT_NAME = "floci-server.crt";
     private static final String SERVER_KEY_NAME = "floci-server.key";
@@ -59,9 +71,11 @@ public class TlsConfigSource implements ConfigSource {
     private final Map<String, String> properties = new HashMap<>();
 
     /**
-     * The directory the most recent bootstrap used for CA and leaf, or null when that bootstrap did
-     * not run the self-signed branch (TLS off, or a user-provided certificate). Reset on every
-     * construction so a later boot in the same JVM never sees a stale value.
+     * The TLS directory the most recent bootstrap used, or null when that bootstrap ran with TLS
+     * off. With a user-provided certificate it holds the container CA bundle and, once
+     * {@code GET /_floci/ca.pem} is called, the local CA; in self-signed mode the CA and the leaf
+     * as well. Reset on every construction so a later boot in the same JVM never sees a stale
+     * value.
      */
     static Path resolvedTlsDir() {
         return resolvedTlsDir;
@@ -79,17 +93,20 @@ public class TlsConfigSource implements ConfigSource {
         String keyPath = resolveProperty("floci.tls.key-path", "");
         String selfSigned = resolveProperty("floci.tls.self-signed", "true");
         String persistentPath = resolveProperty("floci.storage.persistent-path", "./data");
+        Path tlsDir = Path.of(persistentPath, TLS_DIR);
+        resolvedTlsDir = tlsDir;
 
+        Path trustAnchor;
         if (!certPath.isBlank() && !keyPath.isBlank()) {
             validateFileExists(certPath, "TLS certificate");
             validateFileExists(keyPath, "TLS private key");
             LOG.infov("TLS: using user-provided certificate: {0}", certPath);
+            trustAnchor = Path.of(certPath);
         } else if ("true".equalsIgnoreCase(selfSigned)) {
-            Path tlsDir = Path.of(persistentPath, TLS_DIR);
-            resolvedTlsDir = tlsDir;
             Path certFile = tlsDir.resolve(SERVER_CERT_NAME);
             Path keyFile = tlsDir.resolve(SERVER_KEY_NAME);
             FlociCertificateAuthority ca = FlociCertificateAuthority.loadOrCreate(tlsDir);
+            trustAnchor = ca.certificatePath();
 
             if (Files.exists(certFile) && Files.exists(keyFile)) {
                 List<String> currentHostnames = new ArrayList<>(DEFAULT_SAN_HOSTNAMES);
@@ -116,6 +133,8 @@ public class TlsConfigSource implements ConfigSource {
                             + "Set FLOCI_TLS_CERT_PATH + FLOCI_TLS_KEY_PATH, or enable FLOCI_TLS_SELF_SIGNED.");
         }
 
+        writeContainerCaBundle(tlsDir, trustAnchor);
+
         // The default entry of the Quarkus TLS registry. The HTTP server reads it when no
         // quarkus.http.tls-configuration-name is set, and the registry can reload it at runtime.
         properties.put("quarkus.tls.key-store.pem.0.cert", certPath);
@@ -125,8 +144,8 @@ public class TlsConfigSource implements ConfigSource {
         // and does protocol detection to route HTTP and HTTPS to the correct backend.
         properties.put("quarkus.http.insecure-requests", "enabled");
         properties.put("quarkus.http.host", "127.0.0.1");
-        properties.put("quarkus.http.port", "4510");
-        properties.put("quarkus.http.ssl-port", "4511");
+        properties.put("quarkus.http.port", String.valueOf(HTTP_INTERNAL_PORT));
+        properties.put("quarkus.http.ssl-port", String.valueOf(HTTPS_INTERNAL_PORT));
 
         LOG.infov("TLS: HTTPS enabled, proxy will listen on port {0} (HTTP+HTTPS), cert={1}",
                 resolveProperty("floci.port", "4566"), certPath);
@@ -246,6 +265,19 @@ public class TlsConfigSource implements ConfigSource {
         return sans;
     }
 
+    /**
+     * Containers Floci launches get this bundle copied in (Docker) or mounted (Kubernetes). A
+     * failure here must not stop Floci: log it, and containers simply will not trust Floci HTTPS
+     * until a boot manages to write it.
+     */
+    private static void writeContainerCaBundle(Path tlsDir, Path trustAnchor) {
+        try {
+            ContainerCaBundle.write(tlsDir, trustAnchor);
+        } catch (Exception e) {
+            LOG.warnv(e, "TLS: could not write the container CA bundle under {0}: {1}", tlsDir, e.getMessage());
+        }
+    }
+
     private static void validateFileExists(String path, String description) {
         if (!Files.isReadable(Path.of(path))) {
             throw new IllegalStateException(
@@ -274,7 +306,8 @@ public class TlsConfigSource implements ConfigSource {
     }
 
     /**
-     * Extracts custom hostnames from FLOCI_HOSTNAME and FLOCI_BASE_URL configuration.
+     * Extracts custom hostnames from FLOCI_HOSTNAME, FLOCI_BASE_URL and
+     * FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS configuration.
      * Filters out default values like "localhost" and "127.0.0.1".
      * Returns a deduplicated list of custom hostnames.
      *
@@ -301,6 +334,26 @@ public class TlsConfigSource implements ConfigSource {
             }
         } catch (URISyntaxException e) {
             LOG.warnv("TLS: failed to parse base URL for hostname extraction: {0}", baseUrl);
+        }
+
+        // Extract from FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS: devices verify that name on 8883 and 443
+        String iotEndpoint = resolveProperty("floci.services.iot.endpoint-address", "").strip();
+        if (!iotEndpoint.isEmpty()) {
+            try {
+                // Anything beyond host[:port] is a typo: java.net.URI would read "https" as the host of a URL.
+                URI uri = new URI("//" + iotEndpoint);
+                String host = uri.getHost();
+                if (host == null || uri.getUserInfo() != null || !iotEndpoint.equals(uri.getRawAuthority())) {
+                    LOG.warnv("TLS: floci.services.iot.endpoint-address is not a host or host:port, not added to the certificate: {0}",
+                            iotEndpoint);
+                } else if (!isDefaultHostname(host)) {
+                    hostnames.add(host);
+                    LOG.debugv("TLS: extracted hostname from floci.services.iot.endpoint-address: {0}", host);
+                }
+            } catch (URISyntaxException e) {
+                LOG.warnv("TLS: failed to parse floci.services.iot.endpoint-address for hostname extraction: {0}",
+                        iotEndpoint);
+            }
         }
 
         List<String> result = new ArrayList<>(hostnames);

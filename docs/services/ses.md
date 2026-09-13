@@ -64,11 +64,21 @@ Floci exposes the classic Amazon SES Query API used by `aws ses ...` commands an
 | `UpdateConfigurationSetReputationMetricsEnabled` | Enable or disable reputation metrics for a configuration set |
 | `PutConfigurationSetDeliveryOptions` | Set the TLS policy (delivery options) for a configuration set |
 | `CreateReceiptRuleSet`              | Create a receipt rule set (stored inertly)                |
-| `DescribeReceiptRuleSet`            | Read a receipt rule set (Rules always empty)              |
+| `DescribeReceiptRuleSet`            | Read a receipt rule set and its rules                     |
 | `ListReceiptRuleSets`               | List receipt rule sets                                    |
-| `DeleteReceiptRuleSet`              | Delete a receipt rule set (idempotent)                    |
+| `DeleteReceiptRuleSet`              | Delete a receipt rule set (idempotent, cascades rules)    |
 | `SetActiveReceiptRuleSet`           | Mark a rule set active, or clear the active one           |
 | `DescribeActiveReceiptRuleSet`      | Read the active receipt rule set                          |
+| `ReorderReceiptRuleSet`             | Reposition every rule in a set (exact permutation required) |
+| `CloneReceiptRuleSet`               | Copy a rule set and its rules under a new name            |
+| `CreateReceiptRule`                 | Add a receipt rule (stored inertly, action targets validated) |
+| `DescribeReceiptRule`               | Read a receipt rule                                       |
+| `UpdateReceiptRule`                 | Replace a receipt rule in place                           |
+| `DeleteReceiptRule`                 | Delete a receipt rule (idempotent)                        |
+| `SetReceiptRulePosition`            | Reorder a receipt rule within its set                     |
+| `CreateReceiptFilter`               | Create an IP address filter (stored inertly)              |
+| `ListReceiptFilters`                | List IP address filters                                   |
+| `DeleteReceiptFilter`               | Delete an IP address filter (idempotent)                  |
 
 ## Configuration
 
@@ -175,7 +185,7 @@ curl $AWS_ENDPOINT_URL/_aws/ses
 - `SendEmail` stores the text body or the HTML body as the captured message body.
 - `SetIdentityNotificationTopic` publishes to the configured topic on a Bounce/Complaint/Delivery event (triggered via the mailbox simulator addresses or the suppression list), independent of any configuration set. The payload uses the legacy format (`notificationType`, no `mail.tags`, headers only when `SetIdentityHeadersInNotificationsEnabled` is on).
 - Identity (sending authorization) policies are stored and returned as metadata: the policy document, the per-identity limit of 20, and the create/update/delete error shapes match AWS, but Floci does not evaluate policy authorization (Principal-account existence, Resource-ARN match) or gate sending on it.
-- Receipt rule sets are stored inertly: Floci has no inbound-mail endpoint, so a rule set never holds any receipt rules and routes no mail. `CreateReceiptRuleSet` / `DescribeReceiptRuleSet` (Rules always empty) / `ListReceiptRuleSets` / `DeleteReceiptRuleSet` (idempotent) and `SetActiveReceiptRuleSet` / `DescribeActiveReceiptRuleSet` round-trip so tools like Terraform (`aws_ses_receipt_rule_set`, `aws_ses_active_receipt_rule_set`) can declare a rule set during bootstrap. Individual receipt rules and receipt filters are not implemented.
+- Receipt rule sets and receipt rules are stored inertly: Floci has no inbound-mail endpoint, so stored rules route no mail and their actions never execute, but the management API round-trips with AWS ordering, validation, and error semantics (probe-verified). Action targets are validated against the local emulator with the AWS error codes: an SNS `TopicArn`, S3 `BucketName`, or Lambda `FunctionArn` must reference an existing local resource, and a `BounceAction` `Sender` must be a verified identity. Deviations: S3 bucket write permissions, KMS keys, and `ConnectAction` role assumability are not verified (AWS checks these); `WorkmailAction` gets no resource validation (neither does AWS). Receipt IP filters are stored the same way, with the probed AWS validation and the 100-filter limit, but no inbound connection is ever filtered. `ReorderReceiptRuleSet` requires an exact permutation of the set's rules; `CloneReceiptRuleSet` copies them under a new creation timestamp, leaving the active flag behind.
 - Custom verification email templates are stored and returned; `Create`/`Update` require the `FromEmailAddress` to be a verified identity (or a verified domain) and reject an invalid redirection URL, matching AWS. `SendCustomVerificationEmail` renders the template into the `/_aws/ses` inspection mailbox (and the SMTP relay, when configured) and registers the recipient as a pending-verification identity, matching AWS. The template body has no placeholder that AWS substitutes, so it is passed through verbatim with the same fixed disclaimer AWS always appends; the unique verification link AWS appends is not reproduced because Floci has no verification-click flow. The `SuccessRedirectionURL` / `FailureRedirectionURL` are stored and returned by Get/List but are the post-click redirect targets, so they are not used at send time.
 - For the REST JSON API see [SES v2](#v2) below.
 
@@ -250,6 +260,12 @@ Alongside the classic Query API, Floci implements a subset of the SES v2 REST JS
 | `GET` | `/v2/email/dedicated-ip-pools` | `ListDedicatedIpPools` |
 | `GET` | `/v2/email/dedicated-ip-pools/{PoolName}` | `GetDedicatedIpPool` |
 | `DELETE` | `/v2/email/dedicated-ip-pools/{PoolName}` | `DeleteDedicatedIpPool` |
+| `PUT` | `/v2/email/dedicated-ip-pools/{PoolName}/scaling` | `PutDedicatedIpPoolScalingAttributes` |
+| `GET` | `/v2/email/dedicated-ips` | `GetDedicatedIps` |
+| `GET` | `/v2/email/dedicated-ips/{IP}` | `GetDedicatedIp` |
+| `PUT` | `/v2/email/dedicated-ips/{IP}/pool` | `PutDedicatedIpInPool` |
+| `PUT` | `/v2/email/dedicated-ips/{IP}/warmup` | `PutDedicatedIpWarmupAttributes` |
+| `PUT` | `/v2/email/account/dedicated-ips/warmup` | `PutAccountDedicatedIpWarmupAttributes` |
 | `POST` | `/v2/email/contact-lists` | `CreateContactList` |
 | `GET` | `/v2/email/contact-lists` | `ListContactLists` |
 | `GET` | `/v2/email/contact-lists/{ContactListName}` | `GetContactList` |
@@ -267,6 +283,8 @@ Alongside the classic Query API, Floci implements a subset of the SES v2 REST JS
 | `POST` | `/v2/email/tags` | `TagResource` |
 | `DELETE` | `/v2/email/tags?ResourceArn=...&TagKeys=...` | `UntagResource` |
 | `GET` | `/v2/email/tags?ResourceArn=...` | `ListTagsForResource` |
+
+Floci models no leased dedicated IPs: `GetDedicatedIps` is empty and IP-targeted operations return `NotFoundException`, as real AWS does for an account with no leased IPs, with required request members validated first (`BadRequestException`). `PutDedicatedIpPoolScalingAttributes` rejects downgrading a `MANAGED` pool to `STANDARD`, and `PutAccountDedicatedIpWarmupAttributes` stores the flag behind `GetAccount.DedicatedIpAutoWarmupEnabled` (default `true`).
 
 Configuration set event destinations are stored as configuration. The target is not validated for existence; missing targets cause Floci to log a warning and skip that destination. Each event destination must specify exactly one destination type and at least one matching event type. A CloudWatch destination requires a non-empty dimension configuration list, and a Pinpoint destination requires an application ARN.
 

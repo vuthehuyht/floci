@@ -107,6 +107,7 @@ nav:
     - API Gateway: services/api-gateway.md
     - Cognito: services/cognito.md
     - Cognito Identity: services/cognitoidentity.md
+    - Global Accelerator: services/globalaccelerator.md
     - KMS: services/kms.md
     - CloudHSM v2: services/cloudhsmv2.md
     - Kinesis: services/kinesis.md
@@ -119,8 +120,20 @@ nav:
     - IAM: services/iam.md
     - STS: services/sts.md
     - Organizations: services/organizations.md
+    - AWS Account Management: services/account.md
+    - IAM Access Analyzer: services/access-analyzer.md
     - IAM Identity Center (SSO Admin): services/ssoadmin.md
+    - IAM Identity Center (OIDC): services/ssooidc.md
+    - IAM Identity Center (Access Portal): services/ssoportal.md
+    - Identity Store: services/identitystore.md
+    - AWS Budgets: services/budgets.md
     - Amazon Macie: services/macie2.md
+    - Amazon Inspector: services/inspector2.md
+    - Security Hub: services/securityhub.md
+    - Amazon Detective: services/detective.md
+    - Amazon Verified Permissions: services/verifiedpermissions.md
+    - Control Catalog: services/controlcatalog.md
+    - AWS Marketplace: services/marketplace.md
     - Control Tower: services/controltower.md
     - AWS Service Catalog: services/service-catalog.md
     - ElastiCache: services/elasticache.md
@@ -135,6 +148,7 @@ nav:
     - DocumentDB: services/docdb.md
     - Athena: services/athena.md
     - Redshift: services/redshift.md
+    - Redshift Data API: services/redshift-data.md
     - Data Firehose: services/firehose.md
     - EventBridge: services/eventbridge.md
     - EventBridge Pipes: services/pipes.md
@@ -144,6 +158,7 @@ nav:
     - Managed Prometheus (AMP): services/managed-prometheus.md
     - GuardDuty: services/guardduty.md
     - Connect: services/connect.md
+    - AppIntegrations: services/appintegrations.md
     - ACM: services/acm.md
     - ECS: services/ecs.md
     - ECR: services/ecr.md
@@ -155,6 +170,7 @@ nav:
     - EC2: services/ec2.md
     - Lightsail: services/lightsail.md
     - AppConfig: services/appconfig.md
+    - Bedrock: services/bedrock.md
     - Bedrock Runtime: services/bedrock-runtime.md
     - Bedrock AgentCore: services/bedrock-agentcore.md
     - ELB v2: services/elb.md
@@ -179,6 +195,7 @@ nav:
     - AWS IoT Core: services/iot.md
     - AppSync: services/appsync.md
     - Transfer Family: services/transfer.md
+    - DataSync: services/datasync.md
     - AWS Config: services/config.md
     - EMR: services/emr.md
     - EMR Serverless: services/emr-serverless.md

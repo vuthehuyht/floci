@@ -6,6 +6,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -259,12 +260,13 @@ public class ApiGatewayService {
 
         api.setEndpointConfiguration(endpointConfiguration);
 
-        apiStore.put(apiKey(region, api.getId()), api);
-
         // Create root resource "/"
         ApiGatewayResource root = new ApiGatewayResource();
         root.setId(shortId(8));
         root.setPath("/");
+        api.setRootResourceId(root.getId());
+
+        apiStore.put(apiKey(region, api.getId()), api);
         resourceStore.put(resourceKey(region, api.getId(), root.getId()), root);
 
         LOG.infov("Created REST API: {0} ({1}) in {2}", name, api.getId(), region);
@@ -314,6 +316,23 @@ public class ApiGatewayService {
         return resourceStore.scan(k -> k.startsWith(prefix));
     }
 
+    /** The root resource id, with a resource-store fallback for data persisted before it was stored on the API. */
+    public Optional<String> findRootResourceId(String region, String apiId) {
+        Optional<RestApi> api = apiStore.get(apiKey(region, apiId));
+        if (api.isEmpty()) {
+            return Optional.empty();
+        }
+        if (api.get().getRootResourceId() != null) {
+            return Optional.of(api.get().getRootResourceId());
+        }
+
+        String prefix = region + "::" + apiId + "::";
+        return resourceStore.scan(k -> k.startsWith(prefix)).stream()
+                .filter(r -> "/".equals(r.getPath()))
+                .map(ApiGatewayResource::getId)
+                .findFirst();
+    }
+
     public ApiGatewayResource getResource(String region, String apiId, String resourceId) {
         return resourceStore.get(resourceKey(region, apiId, resourceId))
                 .orElseThrow(() -> new AwsException("NotFoundException", "Invalid resource id specified", 404));
@@ -338,7 +357,15 @@ public class ApiGatewayService {
     }
 
     public void deleteResource(String region, String apiId, String resourceId) {
-        getResource(region, apiId, resourceId);
+        ApiGatewayResource resource = getResource(region, apiId, resourceId);
+        // The root resource is created with the API and cannot be removed on its own; it
+        // goes away only when the API does. Allowing it to be deleted would leave the API
+        // with no resource at "/", and so with no rootResourceId to report or to parent a
+        // new resource on, a state that has no way back short of recreating the API.
+        if ("/".equals(resource.getPath())) {
+            throw new AwsException("BadRequestException",
+                    "Invalid resource identifier specified: the root resource cannot be deleted", 400);
+        }
         resourceStore.delete(resourceKey(region, apiId, resourceId));
     }
 
@@ -705,7 +732,11 @@ public class ApiGatewayService {
             String prefix = path.substring(1, path.length() - suffix.length());
             int lastSlash = prefix.lastIndexOf('/');
             if (lastSlash < 0) return;
-            String resourcePath = prefix.substring(0, lastSlash);
+            // AWS escapes the resource path's slashes as ~1 in the patch path ("/~1pets/GET/...")
+            // but reports the setting keyed by the plain path ("pets/GET"), so normalise both the
+            // escaped and unescaped spellings onto that one key.
+            String resourcePath = prefix.substring(0, lastSlash).replace("~1", "/");
+            if (resourcePath.startsWith("/")) resourcePath = resourcePath.substring(1);
             String httpMethod = prefix.substring(lastSlash + 1);
             String methodKey = resourcePath + "/" + httpMethod;
 
@@ -995,6 +1026,29 @@ public class ApiGatewayService {
         return key;
     }
 
+    /**
+     * Replaces an API key's tags wholesale. CloudFormation drives a resource's tags to the
+     * template's desired state on update, so a dropped key has to disappear, which the additive
+     * TagResource shape cannot express.
+     */
+    public ApiKey replaceApiKeyTags(String region, String apiKeyId, Map<String, String> tags) {
+        ApiKey key = getApiKey(region, apiKeyId);
+        // A reserved tag is an id override and only means something at create time, so adding or
+        // changing one here is refused. One the key already carries from its creation may stay, or
+        // a template that pins an id could never change any other tag afterwards.
+        Map<String, String> changed = new HashMap<>();
+        tags.forEach((tagKey, value) -> {
+            if (!Objects.equals(value, key.getTags().get(tagKey))) {
+                changed.put(tagKey, value);
+            }
+        });
+        ReservedTags.rejectApiGatewayReservedTagsOnUpdate(changed);
+        key.setTags(new HashMap<>(tags));
+        key.setLastUpdatedDate(System.currentTimeMillis() / 1000L);
+        apiKeyStore.put(apiKeyGlobalKey(region, apiKeyId), key);
+        return key;
+    }
+
     // ──────────────────────────── Usage Plans ────────────────────────────
 
     public UsagePlan createUsagePlan(String region, Map<String, Object> request) {
@@ -1096,6 +1150,21 @@ public class ApiGatewayService {
     public void deleteUsagePlan(String region, String usagePlanId) {
         getUsagePlan(region, usagePlanId);
         usagePlanStore.delete(usagePlanKey(region, usagePlanId));
+    }
+
+    /**
+     * Replaces a usage plan's tags wholesale. CloudFormation drives a resource's tags to the
+     * template's desired state on update, so a dropped key has to disappear, which the additive
+     * TagResource shape cannot express.
+     */
+    public UsagePlan replaceUsagePlanTags(String region, String usagePlanId, Map<String, String> tags) {
+        UsagePlan plan = getUsagePlan(region, usagePlanId);
+        // createUsagePlan consumes the reserved id-override tags and strips them, so a template that
+        // pinned the id still carries them on every update. They are stripped here the same way
+        // rather than refused, or a pinned plan could never change an ordinary tag again.
+        plan.setTags(ReservedTags.stripApiGatewayReservedTags(tags));
+        usagePlanStore.put(usagePlanKey(region, usagePlanId), plan);
+        return plan;
     }
 
     // ──────────────────────────── Usage Plan Keys ────────────────────────────

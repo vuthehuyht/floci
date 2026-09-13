@@ -97,6 +97,53 @@ class ImageCacheServiceTest {
     }
 
     @Test
+    void acceptsThePulledImageWhenInspectionReportsTheHostVariant() throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class);
+        InspectImageCmd inspectImage = mock(InspectImageCmd.class);
+        PullImageCmd pullImage = mock(PullImageCmd.class);
+        PullImageResultCallback callback = mock(PullImageResultCallback.class);
+        when(dockerClient.inspectImageCmd(IMAGE)).thenReturn(inspectImage);
+        // Docker 29's containerd image store answers for the index, so with the host's variant
+        // already local it keeps reporting that architecture after the foreign pull.
+        when(inspectImage.exec()).thenReturn(
+                new InspectImageResponse().withOs("linux").withArch("arm64"),
+                new InspectImageResponse().withId("sha256:index").withOs("linux").withArch("arm64"));
+        when(dockerClient.pullImageCmd(IMAGE)).thenReturn(pullImage);
+        when(pullImage.withAuthConfig(any())).thenReturn(pullImage);
+        when(pullImage.withPlatform("linux/amd64")).thenReturn(pullImage);
+        when(pullImage.exec(any(PullImageResultCallback.class))).thenReturn(callback);
+
+        String resolvedImage = newService(dockerClient)
+                .ensureImageExists(IMAGE, "linux/amd64");
+
+        assertEquals("sha256:index", resolvedImage);
+        verify(pullImage).withPlatform("linux/amd64");
+    }
+
+    @Test
+    void acceptsThePulledImageWhenInspectionReportsNoPlatform() throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class);
+        InspectImageCmd inspectImage = mock(InspectImageCmd.class);
+        PullImageCmd pullImage = mock(PullImageCmd.class);
+        PullImageResultCallback callback = mock(PullImageResultCallback.class);
+        when(dockerClient.inspectImageCmd(IMAGE)).thenReturn(inspectImage);
+        // The same store with no other variant local: the index it pulled describes no platform
+        // at all.
+        when(inspectImage.exec()).thenThrow(new NotFoundException("image not found"))
+                .thenReturn(new InspectImageResponse().withId("sha256:index").withOs("").withArch(""));
+        when(dockerClient.pullImageCmd(IMAGE)).thenReturn(pullImage);
+        when(pullImage.withAuthConfig(any())).thenReturn(pullImage);
+        when(pullImage.withPlatform("linux/amd64")).thenReturn(pullImage);
+        when(pullImage.exec(any(PullImageResultCallback.class))).thenReturn(callback);
+
+        String resolvedImage = newService(dockerClient)
+                .ensureImageExists(IMAGE, "linux/amd64");
+
+        assertEquals("sha256:index", resolvedImage);
+        verify(pullImage).withPlatform("linux/amd64");
+    }
+
+    @Test
     void skipsPullWhenLocalImageMatchesRequestedPlatform() {
         DockerClient dockerClient = mock(DockerClient.class);
         InspectImageCmd inspectImage = mock(InspectImageCmd.class);
@@ -203,6 +250,37 @@ class ImageCacheServiceTest {
         assertEquals("sha256:arm64-old", service.ensureImageExists(IMAGE, "linux/arm64"));
 
         assertEquals("sha256:arm64-new", service.ensureImageExists(IMAGE, "linux/arm64"));
+        verify(pullImage).exec(any(PullImageResultCallback.class));
+    }
+
+    @Test
+    void repullsDefaultImageWhenCachedImageWasRemoved() throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class);
+        InspectImageCmd inspectImage = mock(InspectImageCmd.class);
+        InspectImageCmd inspectCachedImage = mock(InspectImageCmd.class);
+        PullImageCmd pullImage = mock(PullImageCmd.class);
+        PullImageResultCallback callback = mock(PullImageResultCallback.class);
+        when(dockerClient.inspectImageCmd(IMAGE)).thenReturn(inspectImage);
+        when(dockerClient.inspectImageCmd("sha256:default-old")).thenReturn(inspectCachedImage);
+        when(inspectImage.exec())
+                .thenReturn(new InspectImageResponse()
+                        .withId("sha256:default-old")
+                        .withOs("linux")
+                        .withArch("amd64"))
+                .thenThrow(new NotFoundException("image not found locally"))
+                .thenReturn(new InspectImageResponse()
+                        .withId("sha256:default-new")
+                        .withOs("linux")
+                        .withArch("amd64"));
+        when(inspectCachedImage.exec()).thenThrow(new NotFoundException("image was removed"));
+        when(dockerClient.pullImageCmd(IMAGE)).thenReturn(pullImage);
+        when(pullImage.withAuthConfig(any())).thenReturn(pullImage);
+        when(pullImage.exec(any(PullImageResultCallback.class))).thenReturn(callback);
+
+        ImageCacheService service = newService(dockerClient);
+        assertEquals("sha256:default-old", service.ensureImageExists(IMAGE));
+
+        assertEquals("sha256:default-new", service.ensureImageExists(IMAGE));
         verify(pullImage).exec(any(PullImageResultCallback.class));
     }
 

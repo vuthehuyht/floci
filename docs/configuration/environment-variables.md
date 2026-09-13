@@ -244,6 +244,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_FIREHOSE_ENABLED` | `true` | Enable the Kinesis Data Firehose service |
 | `FLOCI_SERVICES_FIREHOSE_TICK_INTERVAL_SECONDS` | `10` | How often (seconds) the buffer flusher checks for streams whose `BufferingHints.IntervalInSeconds` has elapsed |
 | `FLOCI_SERVICES_FIREHOSE_FLUSH_RECORD_COUNT` | `0` | Emulator-only: flush after this many buffered records (`0` = disabled, AWS-faithful; `1` = LocalStack-style record-at-a-time delivery) |
+| `FLOCI_SERVICES_FIREHOSE_STAGING_BUCKET` | `floci-firehose-staging` | S3 bucket used to stage NDJSON batches before DuckDB writes the Parquet object for format-converting streams |
 
 ### EventBridge
 
@@ -324,6 +325,19 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 |---|---|---|
 | `FLOCI_SERVICES_PIPES_ENABLED` | `true` | Enable the EventBridge Pipes service |
 
+### IoT Core
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_IOT_ENABLED` | `true` | Enable the IoT Core service |
+| `FLOCI_SERVICES_IOT_ENDPOINT_ADDRESS` | _(none)_ | Value `DescribeEndpoint` returns for every endpoint type, and the domain name of the AWS-managed domain configurations. Set it to a bare hostname when the AWS IoT ports (8883, 443, 8443) reach Floci; the name is added to the server certificate. Defaults to the host and port of `FLOCI_BASE_URL`, with `FLOCI_HOSTNAME` applied |
+| `FLOCI_SERVICES_IOT_RULE_SQL_STRICT` | `false` | Reject topic rules whose SQL falls outside the evaluated subset, as AWS does |
+| `FLOCI_SERVICES_IOT_MQTT_ENABLED` | `true` | Run the embedded MQTT broker |
+| `FLOCI_SERVICES_IOT_MQTT_AUTO_START` | `false` | Start the broker at boot instead of on the first IoT API call |
+| `FLOCI_SERVICES_IOT_MQTT_HOST` | `0.0.0.0` | Address the broker listens on |
+| `FLOCI_SERVICES_IOT_MQTT_PORT` | `1883` | Plaintext MQTT port |
+| `FLOCI_SERVICES_IOT_MQTT_TLS_PORT` | `8883` | MQTT over TLS port, opened while `FLOCI_TLS_ENABLED` is `true`; `0` disables it |
+
 ---
 
 ## Services — Container-Backed
@@ -375,6 +389,18 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_MSK_ENABLED` | `true` | Enable the MSK service |
 | `FLOCI_SERVICES_MSK_MOCK` | `false` | When `true`, clusters are created instantly without a real Redpanda container |
 | `FLOCI_SERVICES_MSK_DEFAULT_IMAGE` | `redpandadata/redpanda:latest` | Docker image for Kafka/Redpanda brokers |
+
+### Amazon MQ
+
+| Variable | Default | Description |
+|---|---|---|
+| `FLOCI_SERVICES_AMAZONMQ_ENABLED` | `true` | Enable the Amazon MQ service |
+| `FLOCI_SERVICES_AMAZONMQ_MOCK` | `false` | When `true`, brokers are created instantly without a real RabbitMQ container |
+| `FLOCI_SERVICES_AMAZONMQ_DEFAULT_IMAGE` | `rabbitmq:3-management` | Docker image for RabbitMQ broker containers |
+| `FLOCI_SERVICES_AMAZONMQ_AMQP_HOST_PORT_BASE` | `5672` | First host port in the range the AMQP listener is published on |
+| `FLOCI_SERVICES_AMAZONMQ_AMQP_HOST_PORT_MAX` | `5699` | Last host port in the AMQP range |
+| `FLOCI_SERVICES_AMAZONMQ_CONSOLE_HOST_PORT_BASE` | `15672` | First host port in the range the management console is published on |
+| `FLOCI_SERVICES_AMAZONMQ_CONSOLE_HOST_PORT_MAX` | `15699` | Last host port in the console range |
 
 ### Managed Service for Apache Flink (Kinesis Analytics V2)
 

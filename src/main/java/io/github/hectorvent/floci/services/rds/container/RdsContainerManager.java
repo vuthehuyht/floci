@@ -57,6 +57,8 @@ public class RdsContainerManager {
     private final Map<String, RdsContainerHandle> activeContainers = new ConcurrentHashMap<>();
     private final Map<String, String> activeStorageOwners = new ConcurrentHashMap<>();
     private final Set<String> claimedRuntimes = ConcurrentHashMap.newKeySet();
+    private final Set<String> cleanupPending = ConcurrentHashMap.newKeySet();
+    private volatile boolean dockerUnavailableLogged;
 
     @Inject
     public RdsContainerManager(ContainerBuilder containerBuilder,
@@ -89,6 +91,86 @@ public class RdsContainerManager {
                 config, "rds", volumeId, instanceId);
         return start(runtimeId, instanceId, instanceId, exactVolumeName,
                 engine, image, masterUsername, masterPassword, dbName);
+    }
+
+    /**
+     * Attempts {@link #start} and reports the backend as unavailable instead of propagating the
+     * failure when the cause is that no Docker daemon is reachable from Floci: Floci running
+     * inside Docker without a mounted socket, or a stopped daemon on the host. A failure raised
+     * while the daemon <em>is</em> reachable is a genuine container problem and still propagates,
+     * so nothing changes for a Floci that can start database containers.
+     * <p>
+     * A handle retained by an earlier cleanup failure is cleaned up first, so a container
+     * created just before the daemon went away, or one whose stop failed after its proxy did
+     * not start, is removed once the daemon is back instead of blocking the runtime's next
+     * start. An identity that names only the fixed container name came from a
+     * start that failed before Docker created anything, and is dropped when the daemon is
+     * unreachable so the runtime can retry.
+     *
+     * @return the container handle, or {@code null} when no Docker daemon is reachable
+     */
+    public RdsContainerHandle tryStart(
+            String runtimeId, String instanceId, String containerStorageResourceId,
+            String dockerVolumeName, DatabaseEngine engine, String image,
+            String masterUsername, String masterPassword, String dbName) {
+        String effectiveRuntimeId = runtimeId == null || runtimeId.isBlank() ? instanceId : runtimeId;
+        try {
+            retryRetainedCleanup(effectiveRuntimeId);
+            RdsContainerHandle handle = start(runtimeId, instanceId, containerStorageResourceId,
+                    dockerVolumeName, engine, image, masterUsername, masterPassword, dbName);
+            dockerUnavailableLogged = false;
+            return handle;
+        } catch (RuntimeException e) {
+            if (isDockerReachable()) {
+                throw e;
+            }
+            discardNeverCreatedIdentity(effectiveRuntimeId, dockerVolumeName);
+            if (!dockerUnavailableLogged) {
+                dockerUnavailableLogged = true;
+                LOG.warnv("No Docker daemon is reachable from Floci ({0}). RDS metadata operations "
+                        + "keep working and DB instances still reach 'available', but they have no "
+                        + "backing database container until a daemon becomes reachable.",
+                        e.getMessage());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Probes the configured Docker endpoint, which is how a missing daemon is told apart from a
+     * container that failed for its own reasons.
+     */
+    public boolean isDockerReachable() {
+        try {
+            lifecycleManager.getDockerClient().pingCmd().exec();
+            return true;
+        } catch (Exception e) {
+            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * A handle retained because its cleanup failed, whether from a failed start or from a stop
+     * that could not remove the container, is cleaned up before the runtime starts again. A live
+     * handle that is not pending cleanup is left alone, so a concurrent duplicate start is still
+     * rejected by {@link #start}.
+     */
+    private void retryRetainedCleanup(String runtimeId) {
+        RdsContainerHandle retained = activeContainers.get(runtimeId);
+        if (retained != null && cleanupPending.contains(runtimeId)) {
+            stop(retained);
+        }
+    }
+
+    private void discardNeverCreatedIdentity(String runtimeId, String containerName) {
+        RdsContainerHandle retained = activeContainers.get(runtimeId);
+        if (retained == null || retained.getHost() != null
+                || !retained.getContainerId().equals(containerName)) {
+            return;
+        }
+        activeContainers.remove(runtimeId, retained);
+        releaseOwnership(retained.getStorageKey(), retained.getContainerKey(), runtimeId);
     }
 
     public RdsContainerHandle start(
@@ -220,6 +302,7 @@ public class RdsContainerManager {
                             cleanupContainerId, effectiveRuntimeId, instanceId,
                             null, 0, storageKey, containerKey);
                     activeContainers.put(effectiveRuntimeId, retained);
+                    cleanupPending.add(effectiveRuntimeId);
                     LOG.errorv(cleanupFailure,
                             "Failed to clean up RDS container {0}; retaining storage ownership for {1}",
                             cleanupContainerId, effectiveRuntimeId);
@@ -272,6 +355,7 @@ public class RdsContainerManager {
         } catch (RuntimeException | Error e) {
             activeContainers.putIfAbsent(effectiveHandle.getRuntimeId(), effectiveHandle);
             claimedRuntimes.add(effectiveHandle.getRuntimeId());
+            cleanupPending.add(effectiveHandle.getRuntimeId());
             throw e;
         }
         activeContainers.remove(effectiveHandle.getRuntimeId(), effectiveHandle);
@@ -295,6 +379,13 @@ public class RdsContainerManager {
         if (active != null) {
             stop(active);
         }
+    }
+
+    /** Returns whether a backing RDS container still exists and is running. */
+    public boolean isContainerRunning(String containerId) {
+        return containerId != null
+                && !containerId.isBlank()
+                && lifecycleManager.isContainerRunning(containerId);
     }
 
     /** Returns the retained runtime handle used to persist cleanup identity after a failed start. */
@@ -396,10 +487,16 @@ public class RdsContainerManager {
                 """;
     }
 
+    /**
+     * Connects over TCP loopback on purpose. The official image runs first-boot init against a
+     * temporary server that listens only on the Unix socket, so a socket connection can succeed
+     * before the final server is up. Loopback is trusted by the generated pg_hba.conf.
+     */
     private void initializePostgresIamRole(String containerName, String containerId, String masterUsername) {
         String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
         String[] cmd = {
                 "psql",
+                "-h", "127.0.0.1",
                 "-v", "ON_ERROR_STOP=1",
                 "-U", effectiveUser,
                 "-d", "postgres",
@@ -508,7 +605,7 @@ public class RdsContainerManager {
         for (int attempt = 1; attempt <= 60; attempt++) {
             try {
                 ContainerExecResult result = execInContainer(containerId, cmd, 5);
-                lastOutput = result.output();
+                lastOutput = result.output() + (result.stderr().isEmpty() ? "" : "\n" + result.stderr());
                 if (result.exitCode() == 0) {
                     LOG.infov("Initialized {0} in RDS container {1}", description, containerName);
                     return;
@@ -526,6 +623,120 @@ public class RdsContainerManager {
         throw new IllegalStateException("Timed out initializing " + description + " in " + containerName + ": " + lastOutput);
     }
 
+    public String createPostgresSnapshot(String containerId, String masterUsername) {
+        String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+        String[] cmd = {
+                "pg_dumpall",
+                "-U", effectiveUser
+        };
+        try {
+            ContainerExecResult result = execInContainer(containerId, cmd, 120);
+            if (result.exitCode() != 0) {
+                throw new RuntimeException("pg_dumpall failed with exit code " + result.exitCode() + ": " + result.stderr());
+            }
+            return result.output();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create postgres snapshot", e);
+        }
+    }
+
+    public void restorePostgresSnapshot(String containerId, String masterUsername, String sqlDump) {
+        String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+
+        try {
+            String restoreScript = postgresRestoreScript();
+
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            try (org.apache.commons.compress.archivers.tar.TarArchiveOutputStream tar =
+                         new org.apache.commons.compress.archivers.tar.TarArchiveOutputStream(bos)) {
+                tar.setLongFileMode(org.apache.commons.compress.archivers.tar.TarArchiveOutputStream.LONGFILE_GNU);
+
+                addTarEntry(tar, "dump.sql", sqlDump);
+                addTarEntry(tar, "restore.sh", restoreScript);
+            }
+
+            try (java.io.InputStream tarStream = new java.io.ByteArrayInputStream(bos.toByteArray())) {
+                lifecycleManager.getDockerClient().copyArchiveToContainerCmd(containerId)
+                        .withRemotePath("/tmp")
+                        .withTarInputStream(tarStream)
+                        .exec();
+            }
+
+            String[] cmd = { "sh", "/tmp/restore.sh", effectiveUser };
+
+            ContainerExecResult result = null;
+            for (int i = 0; i < 60; i++) {
+                result = execInContainer(containerId, cmd, 120);
+                if (result.exitCode() == 0) {
+                    break;
+                }
+                if (result.exitCode() != 2) {
+                    break;
+                }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted while restoring postgres snapshot", ie);
+                }
+            }
+
+            if (result == null || result.exitCode() != 0) {
+                String errMsg = result != null ? (result.stderr().isEmpty() ? result.output() : result.stderr()) : "";
+                throw new RuntimeException("psql restore failed with exit code "
+                        + (result != null ? result.exitCode() : -1) + ": " + errMsg);
+            }
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to restore postgres snapshot", e);
+        }
+    }
+
+    static String postgresRestoreScript() {
+        return """
+                #!/bin/sh
+                set -e
+                USER="$1"
+
+                # Drop all non-template, non-postgres databases
+                psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -tAc \\
+                  "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres'" \\
+                  | while read -r db; do
+                      [ -z "$db" ] && continue
+                      psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -c "DROP DATABASE IF EXISTS \\"$db\\""
+                    done
+
+                # Exclude the master user CREATE ROLE statement to avoid conflicts during restore
+                sed -e "s/^CREATE ROLE \\\"\\?$USER\\\"\\?.*;/-- &/" /tmp/dump.sql > /tmp/dump_filtered.sql
+                mv /tmp/dump_filtered.sql /tmp/dump.sql
+
+                # Drop all non-current-user, non-system roles
+                psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -tAc \\
+                  "SELECT rolname FROM pg_roles WHERE rolname <> current_user AND rolname NOT LIKE 'pg_%'" \\
+                  | while read -r role; do
+                      [ -z "$role" ] && continue
+                      psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -c "DROP ROLE IF EXISTS \\"$role\\""
+                    done
+
+                # Replay the dump connected to postgres
+                psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -f /tmp/dump.sql
+                """;
+    }
+
+    private static void addTarEntry(
+            org.apache.commons.compress.archivers.tar.TarArchiveOutputStream tar,
+            String name, String content) throws java.io.IOException {
+        byte[] bytes = content.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        org.apache.commons.compress.archivers.tar.TarArchiveEntry entry =
+                new org.apache.commons.compress.archivers.tar.TarArchiveEntry(name);
+        entry.setSize(bytes.length);
+        entry.setMode(0755);
+        tar.putArchiveEntry(entry);
+        tar.write(bytes);
+        tar.closeArchiveEntry();
+    }
+
     private ContainerExecResult execInContainer(String containerId, String[] cmd, int timeoutSeconds) throws Exception {
         String execId = lifecycleManager.getDockerClient().execCreateCmd(containerId)
                 .withCmd(cmd)
@@ -536,13 +747,19 @@ public class RdsContainerManager {
 
         CountDownLatch latch = new CountDownLatch(1);
         ByteArrayOutputStream output = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
         Closeable callback = lifecycleManager.getDockerClient().execStartCmd(execId).exec(new ResultCallback.Adapter<Frame>() {
             @Override
             public void onNext(Frame frame) {
                 if (frame.getPayload() != null) {
                     try {
-                        output.write(frame.getPayload());
-                    } catch (IOException ignored) {
+                        if (frame.getStreamType() == com.github.dockerjava.api.model.StreamType.STDOUT) {
+                            output.write(frame.getPayload());
+                        } else if (frame.getStreamType() == com.github.dockerjava.api.model.StreamType.STDERR) {
+                            stderr.write(frame.getPayload());
+                        }
+                    } catch (IOException e) {
+                        LOG.warnv(e, "Failed to read output stream for container exec {0}", execId);
                     }
                 }
             }
@@ -561,18 +778,19 @@ public class RdsContainerManager {
         try {
             boolean completed = latch.await(timeoutSeconds, TimeUnit.SECONDS);
             if (!completed) {
-                return new ContainerExecResult(-1, "Timed out after " + timeoutSeconds + "s");
+                return new ContainerExecResult(-1, "Timed out after " + timeoutSeconds + "s", "");
             }
             Long exitCode = lifecycleManager.getDockerClient().inspectExecCmd(execId).exec().getExitCodeLong();
             return new ContainerExecResult(
                     exitCode != null ? exitCode : -1,
-                    output.toString(StandardCharsets.UTF_8));
+                    output.toString(StandardCharsets.UTF_8),
+                    stderr.toString(StandardCharsets.UTF_8));
         } finally {
             callback.close();
         }
     }
 
-    record ContainerExecResult(long exitCode, String output) {}
+    record ContainerExecResult(long exitCode, String output, String stderr) {}
 
     public void removeVolume(String instanceId, String volumeId) {
         removeVolume(instanceId, instanceId,
@@ -624,6 +842,7 @@ public class RdsContainerManager {
             activeStorageOwners.remove(containerKey, runtimeId);
         }
         claimedRuntimes.remove(runtimeId);
+        cleanupPending.remove(runtimeId);
     }
 
     private static String requireSafeStorageComponent(String value, String label) {
