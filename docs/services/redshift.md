@@ -56,9 +56,11 @@ Floci provisions these resource types:
 For `AWS::Redshift::Cluster`:
 
 - `Ref` returns the cluster identifier.
-- `Fn::GetAtt` exposes `Endpoint.Address`, `Endpoint.Port`, `Id`, and `ClusterNamespaceArn` (synthesised, stable).
+- `Fn::GetAtt` exposes `Endpoint.Address`, `Endpoint.Port`, and `ClusterNamespaceArn` (synthesised, stable).
 
 Replacement occurs if `ClusterIdentifier`, `DBName`, `MasterUsername`, or `ClusterSubnetGroupName` changes. Other properties (such as `NodeType`, `MasterUserPassword`, `ClusterParameterGroupName`, and `VpcSecurityGroupIds`) update in place.
+
+For `AWS::Redshift::ClusterParameterGroup`, `Parameters` is applied via `ModifyClusterParameterGroup` on both create and update. `Description` and `ParameterGroupFamily` are replacement properties, matching AWS: changing either creates a new parameter group instead of reusing the prior one.
 
 ### Gaps and Limitations
 

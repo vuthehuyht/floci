@@ -7,12 +7,16 @@ import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplate
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.redshift.RedshiftService;
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
+import io.github.hectorvent.floci.services.redshift.model.ClusterParameterGroup;
 import io.github.hectorvent.floci.services.redshift.model.Endpoint;
+import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -124,6 +128,8 @@ class RedshiftClusterCfnProvisionerTest {
     @Test
     void provisionParameterGroupReusesPriorEntityWithoutCallingCreate() {
         RedshiftService service = mock(RedshiftService.class);
+        ClusterParameterGroup existing = new ClusterParameterGroup("pg1", "redshift-1.0", "d");
+        when(service.getClusterParameterGroup("pg1")).thenReturn(Optional.of(existing));
         RedshiftClusterCfnProvisioner p = new RedshiftClusterCfnProvisioner(service);
         StackResource r = new StackResource();
         r.setResourceType("AWS::Redshift::ClusterParameterGroup");
@@ -135,6 +141,73 @@ class RedshiftClusterCfnProvisionerTest {
 
         verify(service, never()).createClusterParameterGroup(anyString(), anyString(), anyString());
         assertEquals("pg1", r.getPhysicalId());
+        ArgumentCaptor<List<Parameter>> captor = ArgumentCaptor.forClass(List.class);
+        verify(service).modifyClusterParameterGroup(eq("pg1"), captor.capture());
+        assertEquals(1, captor.getValue().size());
+        assertEquals("wlm_json_configuration", captor.getValue().get(0).getParameterName());
+        assertEquals("[]", captor.getValue().get(0).getParameterValue());
+    }
+
+    @Test
+    void provisionParameterGroupAppliesParametersOnCreate() {
+        RedshiftService service = mock(RedshiftService.class);
+        RedshiftClusterCfnProvisioner p = new RedshiftClusterCfnProvisioner(service);
+        StackResource r = new StackResource();
+        r.setResourceType("AWS::Redshift::ClusterParameterGroup");
+        r.setLogicalId("Params");
+
+        p.provision(r, json("""
+            {"ParameterGroupName":"pg1","ParameterGroupFamily":"redshift-1.0","Description":"d",
+             "Parameters":[{"ParameterName":"enable_user_activity_logging","ParameterValue":"true"}]}"""), ctx(null));
+
+        verify(service).createClusterParameterGroup("pg1", "redshift-1.0", "d");
+        ArgumentCaptor<List<Parameter>> captor = ArgumentCaptor.forClass(List.class);
+        verify(service).modifyClusterParameterGroup(eq("pg1"), captor.capture());
+        assertEquals(1, captor.getValue().size());
+        assertEquals("enable_user_activity_logging", captor.getValue().get(0).getParameterName());
+        assertEquals("true", captor.getValue().get(0).getParameterValue());
+    }
+
+    @Test
+    void changingParameterGroupDescriptionTriggersReplacement() {
+        RedshiftService service = mock(RedshiftService.class);
+        ClusterParameterGroup existing = new ClusterParameterGroup("pg1", "redshift-1.0", "old description");
+        when(service.getClusterParameterGroup("pg1")).thenReturn(Optional.of(existing));
+        RedshiftClusterCfnProvisioner p = new RedshiftClusterCfnProvisioner(service);
+
+        StackResource r = new StackResource();
+        r.setResourceType("AWS::Redshift::ClusterParameterGroup");
+        r.setLogicalId("Params");
+        r.setPhysicalId("pg1");
+
+        p.provision(r, json("""
+            {"ParameterGroupName":"pg1","ParameterGroupFamily":"redshift-1.0","Description":"new description"}"""),
+                ctx("pg1"));
+
+        assertNotEquals("pg1", r.getPhysicalId());
+        assertEquals("pg1", p.updateCleanupPhysicalId(r));
+        assertTrue(p.hasReplacementUpdate(r));
+        verify(service).createClusterParameterGroup(eq(r.getPhysicalId()), eq("redshift-1.0"), eq("new description"));
+    }
+
+    @Test
+    void changingParameterGroupFamilyTriggersReplacement() {
+        RedshiftService service = mock(RedshiftService.class);
+        ClusterParameterGroup existing = new ClusterParameterGroup("pg1", "redshift-1.0", "d");
+        when(service.getClusterParameterGroup("pg1")).thenReturn(Optional.of(existing));
+        RedshiftClusterCfnProvisioner p = new RedshiftClusterCfnProvisioner(service);
+
+        StackResource r = new StackResource();
+        r.setResourceType("AWS::Redshift::ClusterParameterGroup");
+        r.setLogicalId("Params");
+        r.setPhysicalId("pg1");
+
+        p.provision(r, json("""
+            {"ParameterGroupName":"pg1","ParameterGroupFamily":"redshift-2.0","Description":"d"}"""), ctx("pg1"));
+
+        assertNotEquals("pg1", r.getPhysicalId());
+        assertEquals("pg1", p.updateCleanupPhysicalId(r));
+        assertTrue(p.hasReplacementUpdate(r));
     }
 
     @Test

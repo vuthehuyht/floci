@@ -5,11 +5,14 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.redshift.RedshiftService;
 import io.github.hectorvent.floci.services.redshift.model.Cluster;
+import io.github.hectorvent.floci.services.redshift.model.ClusterParameterGroup;
+import io.github.hectorvent.floci.services.redshift.model.Parameter;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -53,7 +56,11 @@ public class RedshiftClusterCfnProvisioner implements CfnResourceProvisioner {
                 provisionCluster(r, props, ctx, attributesBefore);
                 ReplacementCleanup.record(r, ctx, attributesBefore);
             }
-            case PARAMETER_GROUP -> provisionParameterGroup(r, props, ctx);
+            case PARAMETER_GROUP -> {
+                Map<String, String> attributesBefore = Map.copyOf(r.getAttributes());
+                provisionParameterGroup(r, props, ctx);
+                ReplacementCleanup.record(r, ctx, attributesBefore);
+            }
             case SUBNET_GROUP -> provisionSubnetGroup(r, props, ctx);
             case SECURITY_GROUP -> provisionSecurityGroup(r, props, ctx);
             default -> throw new IllegalStateException(
@@ -116,7 +123,7 @@ public class RedshiftClusterCfnProvisioner implements CfnResourceProvisioner {
         String id;
         if (createOnlyChanged && (explicitId == null || explicitId.equals(ctx.priorPhysicalId()))) {
             if (explicitId != null && !explicitId.isBlank()) {
-                id = replacementId(explicitId, IDENTIFIER_MAX_LENGTH);
+                id = replacementId(explicitId, IDENTIFIER_MAX_LENGTH, true);
             } else {
                 id = ctx.generatePhysicalName(r.getLogicalId(), IDENTIFIER_MAX_LENGTH, true);
             }
@@ -178,17 +185,31 @@ public class RedshiftClusterCfnProvisioner implements CfnResourceProvisioner {
 
     private void provisionParameterGroup(StackResource r, JsonNode props, ProvisionContext ctx) {
         String explicitName = ctx.resolveOptional(props, "ParameterGroupName");
-        String id = ctx.stablePhysicalName(explicitName, r.getLogicalId(), METADATA_NAME_MAX_LENGTH, false);
         String family = ctx.resolveOptional(props, "ParameterGroupFamily");
         String description = ctx.resolveOptional(props, "Description");
 
+        // Description and ParameterGroupFamily are AWS replacement properties; ParameterGroupName
+        // already forces replacement because a changed explicit name yields a different id below.
+        ClusterParameterGroup prior = ctx.isUpdate() ? findExistingParameterGroup(ctx.priorPhysicalId()) : null;
+        boolean createOnlyChanged = prior != null && (
+                (family != null && !family.equals(prior.getParameterGroupFamily()))
+                || (description != null && !description.equals(prior.getDescription())));
+
+        String id;
+        if (createOnlyChanged && (explicitName == null || explicitName.equals(ctx.priorPhysicalId()))) {
+            String base = explicitName != null && !explicitName.isBlank() ? explicitName : r.getLogicalId();
+            id = replacementId(base, METADATA_NAME_MAX_LENGTH, false);
+        } else {
+            id = ctx.stablePhysicalName(explicitName, r.getLogicalId(), METADATA_NAME_MAX_LENGTH, false);
+        }
+
         if (!ctx.reusesPriorEntity(id)) {
             redshiftService.createClusterParameterGroup(id, family, description);
-        } else {
-            JsonNode params = props != null ? props.get("Parameters") : null;
-            if (params != null && !params.isEmpty()) {
-                LOG.warnv("Cluster parameter group {0}: parameter updates on update are not emulated", id);
-            }
+        }
+
+        List<Parameter> parameters = parseParameters(props);
+        if (!parameters.isEmpty()) {
+            redshiftService.modifyClusterParameterGroup(id, parameters);
         }
 
         Map<String, String> tags = ctx.resolveTags(props, "Tags");
@@ -197,6 +218,29 @@ public class RedshiftClusterCfnProvisioner implements CfnResourceProvisioner {
         }
 
         r.setPhysicalId(id);
+    }
+
+    private ClusterParameterGroup findExistingParameterGroup(String parameterGroupName) {
+        if (parameterGroupName == null || parameterGroupName.isBlank()) {
+            return null;
+        }
+        return redshiftService.getClusterParameterGroup(parameterGroupName).orElse(null);
+    }
+
+    private List<Parameter> parseParameters(JsonNode props) {
+        JsonNode params = props != null ? props.get("Parameters") : null;
+        if (params == null || !params.isArray()) {
+            return List.of();
+        }
+        List<Parameter> parsed = new ArrayList<>();
+        for (JsonNode p : params) {
+            String name = p.path("ParameterName").asText(null);
+            if (name == null || name.isBlank()) {
+                continue;
+            }
+            parsed.add(new Parameter(name, p.path("ParameterValue").asText(null)));
+        }
+        return parsed;
     }
 
     private void provisionSubnetGroup(StackResource r, JsonNode props, ProvisionContext ctx) {
@@ -258,13 +302,14 @@ public class RedshiftClusterCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
-    private String replacementId(String baseId, int maxLength) {
+    private String replacementId(String baseId, int maxLength, boolean lowercase) {
         String suffix = "-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
         int keep = Math.max(0, maxLength - suffix.length());
         String prefix = baseId.length() > keep ? baseId.substring(0, keep) : baseId;
         while (prefix.endsWith("-")) {
             prefix = prefix.substring(0, prefix.length() - 1);
         }
-        return (prefix + suffix).toLowerCase();
+        String result = prefix + suffix;
+        return lowercase ? result.toLowerCase() : result;
     }
 }
