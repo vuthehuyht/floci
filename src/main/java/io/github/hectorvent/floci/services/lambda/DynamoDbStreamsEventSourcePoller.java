@@ -247,13 +247,13 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
 
                 String checkpointSeq = (lastSeq == null || checkpointTrimmed) ? "TRIM_HORIZON" : lastSeq;
                 String batchKey = esm.getUuid() + ":" + shardId + ":" + checkpointSeq;
-                if (invokeResult.getFunctionError() == null) {
+                String checkpoint = invokeResult.getFunctionError() == null
+                        ? successfulInvocationCheckpoint(esm, invokeResult, lastSeq, records, matched)
+                        : null;
+
+                if (checkpoint != null && !checkpoint.equals(lastSeq)) {
                     retryCounts.remove(batchKey);
-                    String checkpoint = successfulInvocationCheckpoint(
-                            esm, invokeResult, lastSeq, records, matched);
-                    if (checkpoint != null && !checkpoint.equals(lastSeq)) {
-                        advanceCheckpoint(esm, shardId, checkpoint);
-                    }
+                    advanceCheckpoint(esm, shardId, checkpoint);
                 } else {
                     Integer maxRetries = esm.getMaximumRetryAttempts();
                     int currentRetries = retryCounts.merge(batchKey, 1, Integer::sum);
@@ -264,8 +264,11 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                         retryCounts.remove(batchKey);
                         advanceCheckpoint(esm, shardId, newestFetchedSeq);
                     } else {
+                        String error = invokeResult.getFunctionError() != null
+                                ? invokeResult.getFunctionError()
+                                : "batchItemFailures";
                         LOG.warnv("DynamoDB Streams ESM {0}: Lambda returned error [{1}], retry {2}, records will be retried",
-                                esm.getUuid(), invokeResult.getFunctionError(), currentRetries);
+                                esm.getUuid(), error, currentRetries);
                     }
                 }
             } catch (Exception e) {

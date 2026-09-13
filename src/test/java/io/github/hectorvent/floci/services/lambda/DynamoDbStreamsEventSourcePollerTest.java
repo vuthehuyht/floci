@@ -684,6 +684,143 @@ class DynamoDbStreamsEventSourcePollerTest {
         assertFalse(dlqPayload.has("hasBeenTruncated"));
     }
 
+    @Test
+    void reportBatchItemFailuresExhaustsRetriesAndDeliversToOnFailureDestination() throws Exception {
+        stubTrimHorizon(List.of(ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}")));
+        InvokeResult result = new InvokeResult();
+        result.setStatusCode(200);
+        result.setRequestId("req-batch-fail");
+        result.setPayload("{\"batchItemFailures\":[{\"itemIdentifier\":\"s1\"}]}".getBytes());
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(result);
+
+        EsmStore store = mock(EsmStore.class);
+        EventSourceMapping esm = filterEsm();
+        esm.setFunctionResponseTypes(List.of("ReportBatchItemFailures"));
+        esm.setMaximumRetryAttempts(1); // 1 retry attempt allowed, 2nd error exhausts retries
+
+        String sqsArn = "arn:aws:sqs:us-east-1:000000000000:my-dlq";
+        EventSourceMapping.DestinationConfig destConfig = new EventSourceMapping.DestinationConfig();
+        EventSourceMapping.OnFailure onFailure = new EventSourceMapping.OnFailure();
+        onFailure.setDestination(sqsArn);
+        destConfig.setOnFailure(onFailure);
+        esm.setDestinationConfig(destConfig);
+
+        DynamoDbStreamsEventSourcePoller p = pollerWith(store);
+
+        // First poll: attempt 1 (initial partial failure, retries left)
+        p.pollAndInvoke(esm);
+        verify(executorService, timeout(2000)).invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse));
+
+        long deadline = System.currentTimeMillis() + 3000;
+        while (System.currentTimeMillis() < deadline) {
+            if (p.activePolls.isEmpty()) {
+                break;
+            }
+            Thread.sleep(25);
+        }
+
+        // After 1st failure: checkpoint not advanced, no DLQ delivery
+        verify(store, never()).saveForAccount(anyString(), any());
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+
+        // Second poll: attempt 2 (retry 1, which exceeds maxRetryAttempts=1 -> exhausted!)
+        p.pollAndInvoke(esm);
+
+        // Checkpoint advanced to "s1"
+        verify(store, timeout(2000)).saveForAccount(eq(ACCOUNT_ID), any());
+        assertEquals("s1", esm.getShardSequenceNumbers().get(DynamoDbStreamService.SHARD_ID));
+
+        // SQS delivery invoked
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+        String expectedQueueUrl = "http://localhost:4566/000000000000/my-dlq";
+        verify(sqsService, timeout(2000)).sendMessage(eq(expectedQueueUrl), bodyCaptor.capture(), eq(0), eq("us-east-1"));
+
+        JsonNode dlqPayload = OBJECT_MAPPER.readTree(bodyCaptor.getValue());
+        assertEquals("1.0", dlqPayload.path("version").asText());
+        assertEquals("RetryAttemptsExhausted", dlqPayload.path("requestContext").path("condition").asText());
+        assertEquals(2, dlqPayload.path("requestContext").path("approximateInvokeCount").asInt());
+        assertEquals("req-batch-fail", dlqPayload.path("requestContext").path("requestId").asText());
+        assertEquals(200, dlqPayload.path("responseContext").path("statusCode").asInt());
+        assertFalse(dlqPayload.path("responseContext").has("functionError"));
+        assertEquals(DynamoDbStreamService.SHARD_ID, dlqPayload.path("DDBStreamBatchInfo").path("shardId").asText());
+        assertEquals("s1", dlqPayload.path("DDBStreamBatchInfo").path("startSequenceNumber").asText());
+        assertEquals("s1", dlqPayload.path("DDBStreamBatchInfo").path("endSequenceNumber").asText());
+        assertEquals(1, dlqPayload.path("DDBStreamBatchInfo").path("batchSize").asInt());
+        assertEquals(STREAM_ARN, dlqPayload.path("DDBStreamBatchInfo").path("streamArn").asText());
+        assertFalse(dlqPayload.has("hasBeenTruncated"));
+    }
+
+    @Test
+    void reportBatchItemFailuresPartialSuccessAdvancesCheckpointAndRetriesFailingItem() throws Exception {
+        when(streamService.getShardIterator(eq(STREAM_ARN), eq(DynamoDbStreamService.SHARD_ID),
+                eq("TRIM_HORIZON"), any())).thenReturn("it-1");
+        when(streamService.getShardIterator(eq(STREAM_ARN), eq(DynamoDbStreamService.SHARD_ID),
+                eq("AFTER_SEQUENCE_NUMBER"), eq("s1"))).thenReturn("it-2");
+        when(streamService.getRecords(eq("it-1"), anyInt())).thenReturn(
+                new DynamoDbStreamService.GetRecordsResult(
+                        List.of(ddbRecord("s1", "INSERT", "{\"status\":{\"S\":\"active\"}}"),
+                                ddbRecord("s2", "INSERT", "{\"status\":{\"S\":\"active\"}}")), "it-1"));
+        when(streamService.getRecords(eq("it-2"), anyInt())).thenReturn(
+                new DynamoDbStreamService.GetRecordsResult(
+                        List.of(ddbRecord("s2", "INSERT", "{\"status\":{\"S\":\"active\"}}")), "it-2"));
+
+        InvokeResult partialFailure = new InvokeResult();
+        partialFailure.setStatusCode(200);
+        partialFailure.setPayload("{\"batchItemFailures\":[{\"itemIdentifier\":\"s2\"}]}".getBytes());
+        when(executorService.invoke(any(), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(partialFailure);
+
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("fn");
+        when(functionStore.getForAccount(ACCOUNT_ID, "us-east-1", "fn")).thenReturn(Optional.of(fn));
+
+        EsmStore store = mock(EsmStore.class);
+        EventSourceMapping esm = filterEsm();
+        esm.setFunctionResponseTypes(List.of("ReportBatchItemFailures"));
+        esm.setMaximumRetryAttempts(0); // exhausts on first failure of s2 standalone
+
+        String sqsArn = "arn:aws:sqs:us-east-1:000000000000:my-dlq";
+        EventSourceMapping.DestinationConfig destConfig = new EventSourceMapping.DestinationConfig();
+        EventSourceMapping.OnFailure onFailure = new EventSourceMapping.OnFailure();
+        onFailure.setDestination(sqsArn);
+        destConfig.setOnFailure(onFailure);
+        esm.setDestinationConfig(destConfig);
+
+        DynamoDbStreamsEventSourcePoller p = pollerWith(store);
+
+        // First poll: s1 succeeds, s2 fails -> checkpoint advances to s1
+        p.pollAndInvoke(esm);
+        verify(store, timeout(2000)).saveForAccount(eq(ACCOUNT_ID), any());
+        assertEquals("s1", esm.getShardSequenceNumbers().get(DynamoDbStreamService.SHARD_ID));
+        verify(sqsService, never()).sendMessage(anyString(), anyString(), anyInt(), anyString());
+
+        long deadline = System.currentTimeMillis() + 3000;
+        while (System.currentTimeMillis() < deadline) {
+            if (p.activePolls.isEmpty()) {
+                break;
+            }
+            Thread.sleep(25);
+        }
+
+        // Second poll: fetches [s2], s2 fails again -> maxRetries=0 exhausts
+        p.pollAndInvoke(esm);
+
+        verify(store, timeout(2000).times(2)).saveForAccount(eq(ACCOUNT_ID), any());
+        assertEquals("s2", esm.getShardSequenceNumbers().get(DynamoDbStreamService.SHARD_ID));
+
+        ArgumentCaptor<String> bodyCaptor = ArgumentCaptor.forClass(String.class);
+        String expectedQueueUrl = "http://localhost:4566/000000000000/my-dlq";
+        verify(sqsService, timeout(2000)).sendMessage(eq(expectedQueueUrl), bodyCaptor.capture(), eq(0), eq("us-east-1"));
+
+        JsonNode dlqPayload = OBJECT_MAPPER.readTree(bodyCaptor.getValue());
+        assertEquals("1.0", dlqPayload.path("version").asText());
+        assertEquals(1, dlqPayload.path("requestContext").path("approximateInvokeCount").asInt());
+        assertEquals("s2", dlqPayload.path("DDBStreamBatchInfo").path("startSequenceNumber").asText());
+        assertEquals("s2", dlqPayload.path("DDBStreamBatchInfo").path("endSequenceNumber").asText());
+        assertEquals(1, dlqPayload.path("DDBStreamBatchInfo").path("batchSize").asInt());
+    }
+
     private JsonNode readRecords(byte[] payload) {
         try {
             return OBJECT_MAPPER.readTree(payload).path("Records");
