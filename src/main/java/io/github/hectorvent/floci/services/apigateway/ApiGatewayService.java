@@ -378,6 +378,7 @@ public class ApiGatewayService {
         method.setAuthorizationType((String) request.getOrDefault("authorizationType", "NONE"));
         method.setAuthorizerId((String) request.get("authorizerId"));
         method.setRequestValidatorId((String) request.get("requestValidatorId"));
+        method.setApiKeyRequired(Boolean.TRUE.equals(request.get("apiKeyRequired")));
 
         @SuppressWarnings("unchecked")
         Map<String, Boolean> reqParams = (Map<String, Boolean>) request.get("requestParameters");
@@ -1948,6 +1949,7 @@ public class ApiGatewayService {
                 String value = op.get("value");
                 if ("/authorizationType" .equals(path)) method.setAuthorizationType(value);
                 else if ("/authorizerId" .equals(path)) method.setAuthorizerId(value);
+                else if ("/apiKeyRequired" .equals(path)) method.setApiKeyRequired(Boolean.parseBoolean(value));
             }
         }
         resourceStore.put(resourceKey(region, apiId, resourceId), getResource(region, apiId, resourceId));
