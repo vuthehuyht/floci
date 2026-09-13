@@ -37,8 +37,11 @@ final class ExtendedS3Exchange {
                     failed = !result.succeeded();
                     deferredReadyForQuery = result.deferredReadyForQuery();
                 }
-                case CopyStatementParser.S3Unload unload -> failed = !runUnload(
-                        client, backend, executeFrame, unload, s3Service, coordinator);
+                case CopyStatementParser.S3Unload unload -> {
+                    CopyResult result = runUnload(client, backend, executeFrame, unload, s3Service, coordinator);
+                    failed = !result.succeeded();
+                    deferredReadyForQuery = result.deferredReadyForQuery();
+                }
             }
         } catch (IOException | RuntimeException e) {
             closeQuietly(client);
@@ -80,7 +83,7 @@ final class ExtendedS3Exchange {
             forwardClientSyncToBackend(sync, backendOut, coordinator);
             drainExecute(client, decoder, coordinator, false);
             sendError(client, e.sqlState(), e.getMessage());
-            return new CopyResult(false, new byte[]{'E'});
+            return new CopyResult(false, drainReadyForQuery(client, decoder, coordinator));
         }
 
         try {
@@ -93,7 +96,7 @@ final class ExtendedS3Exchange {
             drainExecute(client, decoder, coordinator, false);
             String detail = e.getMessage() != null ? e.getMessage() : e.toString();
             sendError(client, "XX000", "S3 COPY failed: " + detail);
-            return new CopyResult(false, new byte[]{'E'});
+            return new CopyResult(false, drainReadyForQuery(client, decoder, coordinator));
         }
 
         forwardClientSyncToBackend(sync, backendOut, coordinator);
@@ -101,7 +104,7 @@ final class ExtendedS3Exchange {
         return new CopyResult(terminal.type() != 'E', null);
     }
 
-    private static boolean runUnload(Socket client, Socket backend,
+    private static CopyResult runUnload(Socket client, Socket backend,
             PostgresWireDecoder.FrontendMessage executeFrame,
             CopyStatementParser.S3Unload spec, S3Service s3Service,
             BackendResponseCoordinator coordinator) throws IOException {
@@ -114,7 +117,7 @@ final class ExtendedS3Exchange {
         PostgresWireDecoder.FrontendMessage first = nextOwnedFrame(client, decoder, coordinator);
         if (first.type() == 'E') {
             forward(client, first);
-            return false;
+            return new CopyResult(false, drainReadyForQuery(client, decoder, coordinator));
         }
         if (first.type() != 'H') {
             throw unexpected(first, "CopyOutResponse");
@@ -127,7 +130,7 @@ final class ExtendedS3Exchange {
             S3CopySimulator.writeCopyFail(backendOut, e.getMessage());
             drainExecute(client, decoder, coordinator, false);
             sendError(client, e.sqlState(), e.getMessage());
-            return false;
+            return new CopyResult(false, drainReadyForQuery(client, decoder, coordinator));
         }
 
         try (collector) {
@@ -141,24 +144,24 @@ final class ExtendedS3Exchange {
                         S3CopySimulator.writeCopyFail(backendOut, e.getMessage());
                         drainExecute(client, decoder, coordinator, false);
                         sendError(client, e.sqlState(), e.getMessage());
-                        return false;
+                        return new CopyResult(false, drainReadyForQuery(client, decoder, coordinator));
                     }
                 } else if (message.type() == 'c') {
                     continue;
                 } else if (message.type() == 'E') {
                     collector.abort();
                     forward(client, message);
-                    return false;
+                    return new CopyResult(false, drainReadyForQuery(client, decoder, coordinator));
                 } else if (message.type() == 'C') {
                     try {
                         collector.complete();
                     } catch (S3CopySimulator.S3TransferException e) {
                         S3CopySimulator.writeCopyFail(backendOut, e.getMessage());
                         sendError(client, e.sqlState(), e.getMessage());
-                        return false;
+                        return new CopyResult(false, drainReadyForQuery(client, decoder, coordinator));
                     }
                     forward(client, message);
-                    return true;
+                    return new CopyResult(true, null);
                 } else {
                     throw unexpected(message, "CopyData, CopyDone, or CommandComplete");
                 }
@@ -237,7 +240,7 @@ final class ExtendedS3Exchange {
 
     private static void forwardClientSyncToBackend(Socket client, OutputStream backendOut,
             BackendResponseCoordinator coordinator) throws IOException {
-        forwardClientSyncToBackend(readClientSync(client), backendOut, coordinator);
+        forwardClientSyncToBackend(readClientSync(client, backendOut), backendOut, coordinator);
     }
 
     private static void forwardClientSyncToBackend(PostgresWireDecoder.FrontendMessage sync, OutputStream backendOut,
