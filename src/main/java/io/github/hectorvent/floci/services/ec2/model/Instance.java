@@ -22,6 +22,7 @@ public class Instance {
     private String subnetId;
     private String vpcId;
     private String privateIpAddress;
+    private String logicalPrivateIpAddress;
     private String publicIpAddress;
     private String privateDnsName;
     private String publicDnsName;
@@ -44,6 +45,7 @@ public class Instance {
     private boolean ebsOptimized = false;
     private boolean enaSupport = true;
     private String iamInstanceProfileArn;
+    private Instant iamInstanceProfileAssociationTime;
     private String stateReasonCode;
     private String stateReasonMessage;
     private String region;
@@ -118,6 +120,10 @@ public class Instance {
 
     public String getPrivateIpAddress() { return privateIpAddress; }
     public void setPrivateIpAddress(String privateIpAddress) { this.privateIpAddress = privateIpAddress; }
+    public String getLogicalPrivateIpAddress() { return logicalPrivateIpAddress; }
+    public void setLogicalPrivateIpAddress(String logicalPrivateIpAddress) {
+        this.logicalPrivateIpAddress = logicalPrivateIpAddress;
+    }
 
     public String getPublicIpAddress() { return publicIpAddress; }
     public void setPublicIpAddress(String publicIpAddress) { this.publicIpAddress = publicIpAddress; }
@@ -177,6 +183,8 @@ public class Instance {
 
     public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
     public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }
+    public Instant getIamInstanceProfileAssociationTime() { return iamInstanceProfileAssociationTime; }
+    public void setIamInstanceProfileAssociationTime(Instant iamInstanceProfileAssociationTime) { this.iamInstanceProfileAssociationTime = iamInstanceProfileAssociationTime; }
 
     public String getStateReasonCode() { return stateReasonCode; }
     public void setStateReasonCode(String stateReasonCode) { this.stateReasonCode = stateReasonCode; }

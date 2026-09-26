@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.athena.model.WorkGroupEngineVersionRe
 import io.github.hectorvent.floci.services.athena.model.WorkGroupTag;
 import io.github.hectorvent.floci.services.floci.duck.FlociDuckClient;
 import io.github.hectorvent.floci.services.glue.GlueService;
+import io.github.hectorvent.floci.services.glue.PartitionProjection;
 import io.github.hectorvent.floci.services.glue.model.Column;
 import io.github.hectorvent.floci.services.glue.model.Database;
 import io.github.hectorvent.floci.services.glue.model.Table;
@@ -216,9 +217,21 @@ public class AthenaService {
 
     public void stopQueryExecution(String id) {
         QueryExecution execution = getQueryExecution(id);
-        execution.getStatus().setState(QueryExecutionState.CANCELLED);
-        execution.getStatus().setCompletionDateTime(Instant.now());
-        queryStore.put(id, execution);
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus().getState())) {
+                return;
+            }
+            execution.getStatus().setState(QueryExecutionState.CANCELLED);
+            execution.getStatus().setCompletionDateTime(Instant.now());
+            queryStore.put(id, execution);
+        }
+    }
+
+    /** A terminal query is never rewritten: a late stop cannot cancel a finished query. */
+    private static boolean isTerminal(QueryExecutionState state) {
+        return state == QueryExecutionState.SUCCEEDED
+                || state == QueryExecutionState.FAILED
+                || state == QueryExecutionState.CANCELLED;
     }
 
     public WorkGroup createWorkGroup(CreateWorkGroupRequest request, String region) {
@@ -569,15 +582,25 @@ public class AthenaService {
     }
 
     private void markSucceeded(String id, QueryExecution execution) {
-        execution.getStatus().setState(QueryExecutionState.SUCCEEDED);
-        execution.getStatus().setCompletionDateTime(Instant.now());
-        queryStore.put(id, execution);
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus().getState())) {
+                return;
+            }
+            execution.getStatus().setState(QueryExecutionState.SUCCEEDED);
+            execution.getStatus().setCompletionDateTime(Instant.now());
+            queryStore.put(id, execution);
+        }
     }
 
     private void markFailed(String id, QueryExecution execution, Throwable failure) {
-        execution.getStatus().setState(QueryExecutionState.FAILED);
-        execution.getStatus().setStateChangeReason(failure.getMessage());
-        queryStore.put(id, execution);
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus().getState())) {
+                return;
+            }
+            execution.getStatus().setState(QueryExecutionState.FAILED);
+            execution.getStatus().setStateChangeReason(failure.getMessage());
+            queryStore.put(id, execution);
+        }
     }
 
     private record CreateDatabaseDdl(String name, boolean ifNotExists, String comment,

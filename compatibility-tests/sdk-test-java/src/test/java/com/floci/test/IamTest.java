@@ -12,35 +12,44 @@ import software.amazon.awssdk.services.iam.model.CreateGroupRequest;
 import software.amazon.awssdk.services.iam.model.CreateGroupResponse;
 import software.amazon.awssdk.services.iam.model.CreateInstanceProfileRequest;
 import software.amazon.awssdk.services.iam.model.CreateInstanceProfileResponse;
+import software.amazon.awssdk.services.iam.model.CreateLoginProfileRequest;
+import software.amazon.awssdk.services.iam.model.CreateLoginProfileResponse;
 import software.amazon.awssdk.services.iam.model.CreatePolicyRequest;
 import software.amazon.awssdk.services.iam.model.CreatePolicyResponse;
 import software.amazon.awssdk.services.iam.model.CreateRoleRequest;
 import software.amazon.awssdk.services.iam.model.CreateRoleResponse;
+import software.amazon.awssdk.services.iam.model.CreateSamlProviderRequest;
+import software.amazon.awssdk.services.iam.model.CreateSamlProviderResponse;
 import software.amazon.awssdk.services.iam.model.CreateUserRequest;
 import software.amazon.awssdk.services.iam.model.CreateUserResponse;
 import software.amazon.awssdk.services.iam.model.DeleteAccessKeyRequest;
 import software.amazon.awssdk.services.iam.model.DeleteGroupRequest;
 import software.amazon.awssdk.services.iam.model.DeleteInstanceProfileRequest;
+import software.amazon.awssdk.services.iam.model.DeleteLoginProfileRequest;
 import software.amazon.awssdk.services.iam.model.DeletePolicyRequest;
-import software.amazon.awssdk.services.iam.model.DeleteRoleRequest;
 import software.amazon.awssdk.services.iam.model.DeleteRolePolicyRequest;
+import software.amazon.awssdk.services.iam.model.DeleteRoleRequest;
+import software.amazon.awssdk.services.iam.model.DeleteSamlProviderRequest;
 import software.amazon.awssdk.services.iam.model.DeleteUserRequest;
 import software.amazon.awssdk.services.iam.model.DetachRolePolicyRequest;
 import software.amazon.awssdk.services.iam.model.DetachUserPolicyRequest;
 import software.amazon.awssdk.services.iam.model.GetAccountSummaryResponse;
-import software.amazon.awssdk.services.iam.model.SummaryKeyType;
 import software.amazon.awssdk.services.iam.model.GetGroupRequest;
 import software.amazon.awssdk.services.iam.model.GetGroupResponse;
 import software.amazon.awssdk.services.iam.model.GetInstanceProfileRequest;
 import software.amazon.awssdk.services.iam.model.GetInstanceProfileResponse;
+import software.amazon.awssdk.services.iam.model.GetLoginProfileRequest;
+import software.amazon.awssdk.services.iam.model.GetLoginProfileResponse;
 import software.amazon.awssdk.services.iam.model.GetPolicyRequest;
 import software.amazon.awssdk.services.iam.model.GetPolicyResponse;
 import software.amazon.awssdk.services.iam.model.GetPolicyVersionRequest;
 import software.amazon.awssdk.services.iam.model.GetPolicyVersionResponse;
-import software.amazon.awssdk.services.iam.model.GetRoleRequest;
-import software.amazon.awssdk.services.iam.model.GetRoleResponse;
 import software.amazon.awssdk.services.iam.model.GetRolePolicyRequest;
 import software.amazon.awssdk.services.iam.model.GetRolePolicyResponse;
+import software.amazon.awssdk.services.iam.model.GetRoleRequest;
+import software.amazon.awssdk.services.iam.model.GetRoleResponse;
+import software.amazon.awssdk.services.iam.model.GetSamlProviderRequest;
+import software.amazon.awssdk.services.iam.model.GetSamlProviderResponse;
 import software.amazon.awssdk.services.iam.model.GetUserRequest;
 import software.amazon.awssdk.services.iam.model.GetUserResponse;
 import software.amazon.awssdk.services.iam.model.ListAccessKeysRequest;
@@ -52,10 +61,15 @@ import software.amazon.awssdk.services.iam.model.ListAttachedUserPoliciesRespons
 import software.amazon.awssdk.services.iam.model.ListEntitiesForPolicyResponse;
 import software.amazon.awssdk.services.iam.model.ListGroupsForUserRequest;
 import software.amazon.awssdk.services.iam.model.ListGroupsForUserResponse;
+import software.amazon.awssdk.services.iam.model.ListInstanceProfileTagsRequest;
+import software.amazon.awssdk.services.iam.model.ListInstanceProfileTagsResponse;
 import software.amazon.awssdk.services.iam.model.ListInstanceProfilesResponse;
 import software.amazon.awssdk.services.iam.model.ListRolePoliciesRequest;
 import software.amazon.awssdk.services.iam.model.ListRolePoliciesResponse;
 import software.amazon.awssdk.services.iam.model.ListRolesResponse;
+import software.amazon.awssdk.services.iam.model.ListSamlProviderTagsRequest;
+import software.amazon.awssdk.services.iam.model.ListSamlProviderTagsResponse;
+import software.amazon.awssdk.services.iam.model.ListSamlProvidersResponse;
 import software.amazon.awssdk.services.iam.model.ListUserTagsRequest;
 import software.amazon.awssdk.services.iam.model.ListUserTagsResponse;
 import software.amazon.awssdk.services.iam.model.ListUsersResponse;
@@ -66,9 +80,17 @@ import software.amazon.awssdk.services.iam.model.RemoveRoleFromInstanceProfileRe
 import software.amazon.awssdk.services.iam.model.RemoveUserFromGroupRequest;
 import software.amazon.awssdk.services.iam.model.SimulatePrincipalPolicyRequest;
 import software.amazon.awssdk.services.iam.model.StatusType;
+import software.amazon.awssdk.services.iam.model.SummaryKeyType;
+import software.amazon.awssdk.services.iam.model.Tag;
+import software.amazon.awssdk.services.iam.model.TagInstanceProfileRequest;
+import software.amazon.awssdk.services.iam.model.TagSamlProviderRequest;
 import software.amazon.awssdk.services.iam.model.TagUserRequest;
+import software.amazon.awssdk.services.iam.model.UntagInstanceProfileRequest;
+import software.amazon.awssdk.services.iam.model.UntagSamlProviderRequest;
 import software.amazon.awssdk.services.iam.model.UntagUserRequest;
 import software.amazon.awssdk.services.iam.model.UpdateAccessKeyRequest;
+import software.amazon.awssdk.services.iam.model.UpdateLoginProfileRequest;
+import software.amazon.awssdk.services.iam.model.UpdateSamlProviderRequest;
 
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -95,8 +117,19 @@ class IamTest {
             + "\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}";
     private static final String POLICY_DOCUMENT = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
             + "\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}]}";
+    private static final String LOGIN_PROFILE_PASSWORD = "Sdk-Test-P4ssword!";
+    private static final String SAML_PROVIDER_NAME = "sdk-test-saml-provider";
+    private static final String SAML_METADATA_DOCUMENT = "<md:EntityDescriptor "
+            + "xmlns:md=\"urn:oasis:names:tc:SAML:2.0:metadata\" entityID=\"https://idp.example.test/sdk-test\">"
+            + "<md:IDPSSODescriptor><md:KeyDescriptor use=\"signing\"><ds:KeyInfo "
+            + "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:X509Data><ds:X509Certificate>"
+            + "c2RrLXRlc3QtY2VydGlmaWNhdGU=</ds:X509Certificate></ds:X509Data></ds:KeyInfo></md:KeyDescriptor>"
+            + "</md:IDPSSODescriptor></md:EntityDescriptor>";
+    private static final String SAML_METADATA_DOCUMENT_UPDATED = SAML_METADATA_DOCUMENT
+            .replace("sdk-test", "sdk-test-updated").replace("c2RrLXRlc3QtY2VydGlmaWNhdGU=", "dXBkYXRlZC1jZXJ0");
     private static String policyArn;
     private static String accessKeyId;
+    private static String samlProviderArn;
 
     @BeforeAll
     static void setup() {
@@ -531,6 +564,154 @@ class IamTest {
 
         assertThat(response.instanceProfiles())
                 .anyMatch(p -> INSTANCE_PROFILE_NAME.equals(p.instanceProfileName()));
+    }
+
+    @Test
+    @Order(44)
+    void tagInstanceProfile() {
+        iam.tagInstanceProfile(TagInstanceProfileRequest.builder()
+                .instanceProfileName(INSTANCE_PROFILE_NAME)
+                .tags(Tag.builder().key("env").value("sdk-test").build())
+                .build());
+    }
+
+    @Test
+    @Order(45)
+    void listInstanceProfileTags() {
+        ListInstanceProfileTagsResponse response = iam.listInstanceProfileTags(
+                ListInstanceProfileTagsRequest.builder().instanceProfileName(INSTANCE_PROFILE_NAME).build());
+
+        assertThat(response.tags())
+                .anyMatch(t -> "env".equals(t.key()));
+    }
+
+    @Test
+    @Order(46)
+    void untagInstanceProfile() {
+        iam.untagInstanceProfile(UntagInstanceProfileRequest.builder()
+                .instanceProfileName(INSTANCE_PROFILE_NAME).tagKeys("env").build());
+    }
+
+    // ── SAML Identity Provider ──────────────────────────────────────────
+
+    @Test
+    @Order(47)
+    void createSamlProvider() {
+        CreateSamlProviderResponse response = iam.createSAMLProvider(CreateSamlProviderRequest.builder()
+                .name(SAML_PROVIDER_NAME).samlMetadataDocument(SAML_METADATA_DOCUMENT)
+                .tags(Tag.builder().key("owner").value("sdk-test").build())
+                .build());
+
+        samlProviderArn = response.samlProviderArn();
+        assertThat(samlProviderArn).contains(SAML_PROVIDER_NAME);
+        assertThat(response.tags()).anyMatch(t -> "owner".equals(t.key()) && "sdk-test".equals(t.value()));
+    }
+
+    @Test
+    @Order(48)
+    void getSamlProvider() {
+        GetSamlProviderResponse response = iam.getSAMLProvider(GetSamlProviderRequest.builder()
+                .samlProviderArn(samlProviderArn).build());
+
+        assertThat(response.samlMetadataDocument()).contains("sdk-test");
+    }
+
+    @Test
+    @Order(49)
+    void listSamlProviders() {
+        ListSamlProvidersResponse response = iam.listSAMLProviders();
+
+        assertThat(response.samlProviderList()).anyMatch(p -> samlProviderArn.equals(p.arn()));
+    }
+
+    @Test
+    @Order(50)
+    void tagSamlProvider() {
+        iam.tagSAMLProvider(TagSamlProviderRequest.builder()
+                .samlProviderArn(samlProviderArn)
+                .tags(Tag.builder().key("env").value("sdk-test").build())
+                .build());
+    }
+
+    @Test
+    @Order(51)
+    void listSamlProviderTags() {
+        ListSamlProviderTagsResponse response = iam.listSAMLProviderTags(
+                ListSamlProviderTagsRequest.builder().samlProviderArn(samlProviderArn).build());
+
+        assertThat(response.tags()).anyMatch(t -> "env".equals(t.key()));
+    }
+
+    @Test
+    @Order(52)
+    void untagSamlProvider() {
+        iam.untagSAMLProvider(UntagSamlProviderRequest.builder()
+                .samlProviderArn(samlProviderArn).tagKeys("env").build());
+    }
+
+    @Test
+    @Order(53)
+    void updateSamlProvider() {
+        iam.updateSAMLProvider(UpdateSamlProviderRequest.builder()
+                .samlProviderArn(samlProviderArn).samlMetadataDocument(SAML_METADATA_DOCUMENT_UPDATED).build());
+
+        GetSamlProviderResponse response = iam.getSAMLProvider(GetSamlProviderRequest.builder()
+                .samlProviderArn(samlProviderArn).build());
+        assertThat(response.samlMetadataDocument()).contains("sdk-test-updated");
+    }
+
+    @Test
+    @Order(54)
+    void deleteSamlProvider() {
+        iam.deleteSAMLProvider(DeleteSamlProviderRequest.builder().samlProviderArn(samlProviderArn).build());
+    }
+
+    // ── Login Profile ──────────────────────────────────────────────────
+
+    @Test
+    @Order(39)
+    void createLoginProfile() {
+        CreateLoginProfileResponse response = iam.createLoginProfile(CreateLoginProfileRequest.builder()
+                .userName(USER_NAME).password(LOGIN_PROFILE_PASSWORD).passwordResetRequired(false).build());
+
+        assertThat(response.loginProfile().userName()).isEqualTo(USER_NAME);
+        assertThat(response.loginProfile().passwordResetRequired()).isFalse();
+        assertThat(response.loginProfile().createDate()).isNotNull();
+    }
+
+    @Test
+    @Order(40)
+    void getLoginProfile() {
+        GetLoginProfileResponse response = iam.getLoginProfile(GetLoginProfileRequest.builder()
+                .userName(USER_NAME).build());
+
+        assertThat(response.loginProfile().userName()).isEqualTo(USER_NAME);
+        assertThat(response.loginProfile().passwordResetRequired()).isFalse();
+    }
+
+    @Test
+    @Order(41)
+    void updateLoginProfile() {
+        iam.updateLoginProfile(UpdateLoginProfileRequest.builder()
+                .userName(USER_NAME).passwordResetRequired(true).build());
+
+        GetLoginProfileResponse response = iam.getLoginProfile(GetLoginProfileRequest.builder()
+                .userName(USER_NAME).build());
+        assertThat(response.loginProfile().passwordResetRequired()).isTrue();
+    }
+
+    @Test
+    @Order(42)
+    void deleteLoginProfile() {
+        iam.deleteLoginProfile(DeleteLoginProfileRequest.builder().userName(USER_NAME).build());
+    }
+
+    @Test
+    @Order(43)
+    void getLoginProfileAfterDeleteThrows() {
+        assertThatThrownBy(() -> iam.getLoginProfile(GetLoginProfileRequest.builder()
+                .userName(USER_NAME).build()))
+                .isInstanceOf(NoSuchEntityException.class);
     }
 
     // ── Error Cases ────────────────────────────────────────────────────

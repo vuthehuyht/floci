@@ -102,10 +102,15 @@ public class AwsQueryController {
             "TagUser", "UntagUser", "ListUserTags",
             "TagRole", "UntagRole", "ListRoleTags",
             "TagPolicy", "UntagPolicy", "ListPolicyTags",
+            "TagInstanceProfile", "UntagInstanceProfile", "ListInstanceProfileTags",
             "CreateLoginProfile", "GetLoginProfile", "DeleteLoginProfile", "UpdateLoginProfile",
             "GenerateCredentialReport", "GetCredentialReport",
             "GetAccountSummary", "GetAccountAuthorizationDetails",
-            "SimulatePrincipalPolicy"
+            "SimulatePrincipalPolicy", "SimulateCustomPolicy",
+            "GetContextKeysForCustomPolicy", "GetContextKeysForPrincipalPolicy",
+            "ListSAMLProviders", "CreateSAMLProvider", "GetSAMLProvider",
+            "UpdateSAMLProvider", "DeleteSAMLProvider",
+            "TagSAMLProvider", "UntagSAMLProvider", "ListSAMLProviderTags"
     );
 
     private static final Set<String> AUTOSCALING_ACTIONS = Set.of(
@@ -290,7 +295,7 @@ public class AwsQueryController {
             // the Query/XML wire — SDK parsers fail before they can surface anything useful.
             LOG.errorv(e, "Unhandled error dispatching Query action {0} for service {1}", action, service);
             return xmlErrorResponse("InternalFailure",
-                    "Unexpected error: " + e.getMessage(), 500, "Receiver");
+                    "Unexpected error: " + AwsErrorMessages.describe(e), 500, "Receiver");
         }
     }
 
@@ -608,6 +613,7 @@ public class AwsQueryController {
             "CreateClusterParameterGroup", "DescribeClusterParameterGroups", "DescribeClusterParameters", "DeleteClusterParameterGroup",
             "ModifyClusterParameterGroup",
             "CreateClusterSubnetGroup", "DescribeClusterSubnetGroups", "ModifyClusterSubnetGroup", "DeleteClusterSubnetGroup",
+            "CreateSnapshotCopyGrant", "DescribeSnapshotCopyGrants", "DeleteSnapshotCopyGrant",
             "CreateTags", "DeleteTags", "DescribeTags",
             "GetClusterCredentials", "GetClusterCredentialsWithIAM"
     );

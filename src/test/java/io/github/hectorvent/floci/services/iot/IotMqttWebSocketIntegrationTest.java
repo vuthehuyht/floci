@@ -40,9 +40,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+import static io.github.hectorvent.floci.services.iot.IotMqttEnabledIntegrationTest.AWS_MAX_PAYLOAD;
+import static io.github.hectorvent.floci.services.iot.IotMqttEnabledIntegrationTest.randomPayload;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -66,6 +71,7 @@ public class IotMqttWebSocketIntegrationTest {
     static final int TLS_PORT = 18837;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final short CLOSE_UNSUPPORTED_DATA = 1003;
+    private static final int CHURN_THREADS = 10;
 
     @ConfigProperty(name = "quarkus.http.test-ssl-port", defaultValue = "0")
     int testSslPort;
@@ -228,6 +234,38 @@ public class IotMqttWebSocketIntegrationTest {
     }
 
     @Test
+    void publishOfTheAwsMaximumPayloadIsDeliveredOverWss() throws Exception {
+        String topic = "ws/limit/" + System.nanoTime();
+        byte[] payload = randomPayload(AWS_MAX_PAYLOAD);
+
+        try (WsClient subscriber = WsClient.connect(wss("/mqtt"), "ws-limit-sub-" + System.nanoTime(), null, null)) {
+            subscriber.subscribe(topic);
+            try (WsClient publisher = WsClient.connect(wss("/mqtt"), "ws-limit-pub-" + System.nanoTime(), null, null)) {
+                publisher.publish(topic, payload, 1);
+            }
+            assertArrayEquals(payload, subscriber.takePayload());
+        }
+    }
+
+    @Test
+    void publishAboveTheAwsMaximumPayloadDisconnectsOverWss() throws Exception {
+        String topic = "ws/over-limit/" + System.nanoTime();
+        byte[] after = "after".getBytes(StandardCharsets.UTF_8);
+
+        try (WsClient subscriber = WsClient.connect(wss("/mqtt"), "ws-over-sub-" + System.nanoTime(), null, null)) {
+            subscriber.subscribe(topic);
+            try (WsClient publisher = WsClient.connect(wss("/mqtt"), "ws-over-pub-" + System.nanoTime(), null, null)) {
+                assertThrows(MqttException.class, () -> publisher.publish(topic, randomPayload(AWS_MAX_PAYLOAD + 1), 1));
+                assertTrue(publisher.awaitConnectionLost(10, TimeUnit.SECONDS));
+            }
+            try (WsClient next = WsClient.connect(wss("/mqtt"), "ws-over-next-" + System.nanoTime(), null, null)) {
+                next.publish(topic, after, 0);
+            }
+            assertArrayEquals(after, subscriber.takePayload(), "the oversized publish is never delivered");
+        }
+    }
+
+    @Test
     void manyConcurrentWebSocketClientsEachReceiveThePublish() throws Exception {
         String topic = "ws/fanout/" + System.nanoTime();
         byte[] payload = "to everyone".getBytes(StandardCharsets.UTF_8);
@@ -274,14 +312,29 @@ public class IotMqttWebSocketIntegrationTest {
 
     @Test
     void connectDisconnectChurnLeavesNoBrokerSessionBehind() throws Exception {
+        // Each connect costs a fixed ~300ms inside the Paho client (its sender, receiver and callback
+        // threads each sleep 100ms while starting), so the cycles run concurrently to keep the
+        // churn from being 30 of those in a row.
         List<String> clientIds = new ArrayList<>();
-        for (int i = 0; i < 30; i++) {
-            String clientId = "churn-" + i + "-" + System.nanoTime();
-            clientIds.add(clientId);
-            String url = i % 2 == 0 ? ws("/mqtt") : wss("/mqtt");
-            try (WsClient client = WsClient.connect(url, clientId, null, null)) {
-                assertTrue(client.isConnected());
+        ExecutorService pool = Executors.newFixedThreadPool(CHURN_THREADS);
+        try {
+            List<Future<?>> cycles = new ArrayList<>();
+            for (int i = 0; i < 30; i++) {
+                String clientId = "churn-" + i + "-" + System.nanoTime();
+                clientIds.add(clientId);
+                String url = i % 2 == 0 ? ws("/mqtt") : wss("/mqtt");
+                cycles.add(pool.submit(() -> {
+                    try (WsClient client = WsClient.connect(url, clientId, null, null)) {
+                        assertTrue(client.isConnected());
+                    }
+                    return null;
+                }));
             }
+            for (Future<?> cycle : cycles) {
+                cycle.get(30, TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
         }
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
         for (String clientId : clientIds) {
@@ -345,6 +398,7 @@ public class IotMqttWebSocketIntegrationTest {
 
         static WsClient connect(String url, String clientId, String username, String password) throws Exception {
             MqttClient client = new MqttClient(url, clientId, new MemoryPersistence());
+            client.setTimeToWait(10_000);
             WsClient wsClient = new WsClient(client);
             client.setCallback(new MqttCallback() {
                 @Override

@@ -39,6 +39,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.LongSupplier;
 
 @ApplicationScoped
 public class DynamoDbStreamsEventSourcePoller implements Resettable {
@@ -51,11 +52,12 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
 
     /** Raised by the stream when a stored checkpoint has aged out of the retained window. */
     private static final String TRIMMED_DATA_ACCESS_EXCEPTION = "TrimmedDataAccessException";
+    static final long MAX_RETRY_BACKOFF_MS = 60_000;
 
     private final Vertx vertx;
     private final DynamoDbStreamService streamService;
     private final LambdaExecutorService executorService;
-    private final LambdaFunctionStore functionStore;
+    private final LambdaTargetResolver targetResolver;
     private final EsmStore esmStore;
     private final ObjectMapper objectMapper;
     private final PipesFilterMatcher filterMatcher;
@@ -64,9 +66,14 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     private final S3Service s3Service;
     private final String baseUrl;
     private final long pollIntervalMs;
+    private final LongSupplier clock;
     private final ConcurrentHashMap<String, Long> timerIds = new ConcurrentHashMap<>();
     final ConcurrentHashMap<String, Boolean> activePolls = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Integer> retryCounts = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Long> retryNotBefore = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> bisectLimits = new ConcurrentHashMap<>();
+    final Set<String> stopped = ConcurrentHashMap.newKeySet();
+    private volatile boolean resetting;
     private final ExecutorService pollExecutor = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "dynamodb-streams-esm-poller");
         t.setDaemon(true);
@@ -76,7 +83,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     @Inject
     public DynamoDbStreamsEventSourcePoller(Vertx vertx, DynamoDbStreamService streamService,
                                             LambdaExecutorService executorService,
-                                            LambdaFunctionStore functionStore,
+                                            LambdaTargetResolver targetResolver,
                                             EsmStore esmStore,
                                             ObjectMapper objectMapper,
                                             EmulatorConfig config,
@@ -84,10 +91,25 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                                             SqsService sqsService,
                                             SnsService snsService,
                                             S3Service s3Service) {
+        this(vertx, streamService, executorService, targetResolver, esmStore, objectMapper, config,
+                filterMatcher, sqsService, snsService, s3Service, System::currentTimeMillis);
+    }
+
+    DynamoDbStreamsEventSourcePoller(Vertx vertx, DynamoDbStreamService streamService,
+                                     LambdaExecutorService executorService,
+                                     LambdaTargetResolver targetResolver,
+                                     EsmStore esmStore,
+                                     ObjectMapper objectMapper,
+                                     EmulatorConfig config,
+                                     PipesFilterMatcher filterMatcher,
+                                     SqsService sqsService,
+                                     SnsService snsService,
+                                     S3Service s3Service,
+                                     LongSupplier clock) {
         this.vertx = vertx;
         this.streamService = streamService;
         this.executorService = executorService;
-        this.functionStore = functionStore;
+        this.targetResolver = targetResolver;
         this.esmStore = esmStore;
         this.objectMapper = objectMapper;
         this.pollIntervalMs = config.services().lambda().pollIntervalMs();
@@ -96,13 +118,16 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         this.sqsService = sqsService;
         this.snsService = snsService;
         this.s3Service = s3Service;
+        this.clock = clock;
     }
 
     public void startPersistedPollers() {
         for (EventSourceMapping esm : esmStore.listAll()) {
-            if (esm.isEnabled() && esm.getEventSourceArn().contains(":dynamodb:")) {
+            if (esm.getEventSourceArn() != null && esm.getEventSourceArn().contains(":dynamodb:")) {
                 discardStaleShardCheckpoints(esm);
-                startPolling(esm);
+                if (esm.isEnabled()) {
+                    startPolling(esm);
+                }
             }
         }
         LOG.infov("DynamoDbStreamsEventSourcePoller initialized");
@@ -133,6 +158,17 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         esmStore.saveForAccount(esm.getAccountId(), esm);
     }
 
+    /** Pins a new LATEST mapping after the stream's newest record, so only later writes are delivered. */
+    public void initializeStartingPosition(EventSourceMapping esm) {
+        if (!"LATEST".equals(esm.getStartingPosition()) || !esm.getShardSequenceNumbers().isEmpty()) {
+            return;
+        }
+        String latest = streamService.latestSequenceNumber(esm.getEventSourceArn());
+        if (latest != null) {
+            esm.getShardSequenceNumbers().put(DynamoDbStreamService.SHARD_ID, latest);
+        }
+    }
+
     @PreDestroy
     void shutdown() {
         pollExecutor.shutdownNow();
@@ -140,14 +176,29 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         timerIds.clear();
     }
 
+    @Override
+    public synchronized void beforeReset() {
+        // Taking the monitor drains an in-flight advanceCheckpoint save; it is released before the wipe.
+        resetting = true;
+    }
+
+    @Override
+    public synchronized void afterReset() {
+        resetting = false;
+    }
+
     public void clear() {
         timerIds.values().forEach(vertx::cancelTimer);
         timerIds.clear();
         activePolls.clear();
+        stopped.clear();
         retryCounts.clear();
+        retryNotBefore.clear();
+        bisectLimits.clear();
     }
 
-    public void startPolling(EventSourceMapping esm) {
+    public synchronized void startPolling(EventSourceMapping esm) {
+        stopped.remove(esm.getUuid());
         if (timerIds.containsKey(esm.getUuid())) {
             return;
         }
@@ -163,13 +214,24 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         LOG.infov("Started DynamoDB Streams polling for ESM {0} → {1}", uuid, esm.getEventSourceArn());
     }
 
-    public void stopPolling(String uuid) {
+    /**
+     * Drops the stop tombstone. Safe once the store delete has run, because exists() in the
+     * synchronized advanceCheckpoint then refuses any write-back on its own.
+     */
+    void mappingDeleted(String uuid) {
+        stopped.remove(uuid);
+    }
+
+    public synchronized void stopPolling(String uuid) {
+        stopped.add(uuid);
         Long timerId = timerIds.remove(uuid);
         if (timerId != null) {
             vertx.cancelTimer(timerId);
             LOG.debugv("Stopped DynamoDB Streams polling for ESM {0}", uuid);
         }
         retryCounts.keySet().removeIf(k -> k.startsWith(uuid + ":"));
+        retryNotBefore.keySet().removeIf(k -> k.startsWith(uuid + ":"));
+        bisectLimits.keySet().removeIf(k -> k.startsWith(uuid + ":"));
     }
 
 
@@ -179,16 +241,17 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         }
         pollExecutor.submit(() -> {
             try {
-                LambdaFunction fn = functionStore.getForAccount(esm.getAccountId(), esm.getRegion(), esm.getFunctionName()).orElse(null);
+                String streamArn = esm.getEventSourceArn();
+                String shardId = DynamoDbStreamService.SHARD_ID;
+                String lastSeq = esm.getShardSequenceNumbers().get(shardId);
+                String persistedKey = batchStateKey(esm.getUuid(), shardId, lastSeq);
+
+                LambdaFunction fn = targetResolver.resolveMappingTarget(esm).orElse(null);
                 if (fn == null) {
                     LOG.warnv("DynamoDB Streams ESM {0}: function {1} not found, skipping",
                             esm.getUuid(), esm.getFunctionName());
                     return;
                 }
-
-                String streamArn = esm.getEventSourceArn();
-                String shardId = DynamoDbStreamService.SHARD_ID;
-                String lastSeq = esm.getShardSequenceNumbers().get(shardId);
 
                 boolean checkpointTrimmed = false;
                 DynamoDbStreamService.GetRecordsResult result;
@@ -196,12 +259,14 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                     String iterator = lastSeq == null
                             ? streamService.getShardIterator(streamArn, shardId, "TRIM_HORIZON", null)
                             : streamService.getShardIterator(streamArn, shardId, "AFTER_SEQUENCE_NUMBER", lastSeq);
-                    result = streamService.getRecords(iterator, esm.getBatchSize());
+                    result = streamService.getRecords(iterator,
+                            Math.min(bisectLimit(esm, persistedKey), esm.getBatchSize()));
                 } catch (AwsException e) {
                     if (!TRIMMED_DATA_ACCESS_EXCEPTION.equals(e.getErrorCode())) {
                         throw e;
                     }
                     checkpointTrimmed = true;
+                    clearBatchState(persistedKey);
                     // The checkpoint fell outside the retained window, so the cursor it names can
                     // never succeed again. Retrying it wedges the ESM permanently: every later
                     // write reaches the stream and none is ever delivered. Resume from the oldest
@@ -212,11 +277,21 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                                     + "trim horizon; records between were dropped from the stream",
                             esm.getUuid(), lastSeq);
                     String horizon = streamService.getShardIterator(streamArn, shardId, "TRIM_HORIZON", null);
-                    result = streamService.getRecords(horizon, esm.getBatchSize());
+                    result = streamService.getRecords(horizon, Math.min(esm.getBatchSize(),
+                            bisectLimit(esm, batchStateKey(esm.getUuid(), shardId, null))));
                 }
                 List<DynamoDbStreamRecord> records = result.records();
 
                 if (records.isEmpty()) {
+                    return;
+                }
+                // ponytail: a stop or reset racing this check does not cancel an in-flight invoke; the stop checks in
+                // advanceCheckpoint and dispose drop its checkpoint and OnFailure send. Only a stop landing
+                // between dispose's check and the send itself still delivers; a lock around the send would close it.
+                boolean enabled = esmStore.getForAccount(esm.getAccountId(), esm.getUuid())
+                        .map(EventSourceMapping::isEnabled)
+                        .orElse(false);
+                if (resetting || !enabled) {
                     return;
                 }
 
@@ -236,8 +311,15 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                             records, filterNodes, filterMatcher.applyFilterCriteria(filterNodes, filterParams));
                 }
 
+                String batchKey = batchStateKey(esm.getUuid(), shardId, checkpointTrimmed ? null : lastSeq);
                 if (matched.isEmpty()) {
+                    clearBatchState(batchKey);
                     advanceCheckpoint(esm, shardId, newestFetchedSeq);
+                    return;
+                }
+
+                long now = clock.getAsLong();
+                if (now < retryNotBefore.getOrDefault(batchKey, 0L)) {
                     return;
                 }
 
@@ -256,59 +338,85 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                     }
                     throw e;
                 }
+                if (!exists(esm)) {
+                    LOG.debugv("DynamoDB Streams ESM {0} was deleted during the invocation, dropping its result",
+                            esm.getUuid());
+                    return;
+                }
 
-                String checkpointSeq = (lastSeq == null || checkpointTrimmed) ? "TRIM_HORIZON" : lastSeq;
-                String batchKey = esm.getUuid() + ":" + shardId + ":" + checkpointSeq;
                 CheckpointOutcome outcome = invokeResult.getFunctionError() == null
                         ? successfulInvocationCheckpoint(esm, invokeResult, lastSeq, records, matched)
                         : new CheckpointOutcome(null, 0);
 
                 if (outcome.lowestFailedIndex() == records.size()) {
-                    retryCounts.remove(batchKey);
+                    clearBatchState(batchKey);
                     advanceCheckpoint(esm, shardId, outcome.checkpoint());
                 } else if (outcome.lowestFailedIndex() > 0) {
-                    retryCounts.remove(batchKey);
+                    clearBatchState(batchKey);
 
                     String nextCheckpoint = outcome.checkpoint();
-                    String nextBatchKey = esm.getUuid() + ":" + shardId + ":" + nextCheckpoint;
+                    String nextBatchKey = batchStateKey(esm.getUuid(), shardId, nextCheckpoint);
                     Integer maxRetries = esm.getMaximumRetryAttempts();
                     int currentRetries = retryCounts.merge(nextBatchKey, 1, Integer::sum);
+                    Set<String> deliveredSeqs = new HashSet<>();
+                    for (DynamoDbStreamRecord rec : matched) {
+                        deliveredSeqs.add(rec.getSequenceNumber());
+                    }
+                    List<DynamoDbStreamRecord> failedRecords = new ArrayList<>();
+                    for (int i = outcome.lowestFailedIndex(); i < records.size(); i++) {
+                        DynamoDbStreamRecord rec = records.get(i);
+                        if (deliveredSeqs.contains(rec.getSequenceNumber())) {
+                            failedRecords.add(rec);
+                        }
+                    }
+                    if (failedRecords.isEmpty()) {
+                        failedRecords = records.subList(outcome.lowestFailedIndex(), records.size());
+                    }
 
-                    if (maxRetries != null && maxRetries >= 0 && currentRetries > maxRetries) {
+                    if (hasExceededMaximumRecordAge(esm, failedRecords, now)) {
+                        LOG.warnv("DynamoDB Streams ESM {0}: maximum record age exceeded for batch ending at {1}",
+                                esm.getUuid(), newestFetchedSeq);
+                        dispose(esm, shardId, nextBatchKey, new PendingFailure(failedRecords, invokeResult,
+                                currentRetries, "MaximumRecordAgeExceeded", newestFetchedSeq));
+                    } else if (maxRetries != null && maxRetries >= 0 && currentRetries > maxRetries) {
                         LOG.warnv("DynamoDB Streams ESM {0}: maximum retry attempts ({1}) exhausted for batch ending at {2}",
                                 esm.getUuid(), maxRetries, newestFetchedSeq);
-                        Set<String> deliveredSeqs = new HashSet<>();
-                        for (DynamoDbStreamRecord rec : matched) {
-                            deliveredSeqs.add(rec.getSequenceNumber());
-                        }
-                        List<DynamoDbStreamRecord> failedRecords = new ArrayList<>();
-                        for (int i = outcome.lowestFailedIndex(); i < records.size(); i++) {
-                            DynamoDbStreamRecord rec = records.get(i);
-                            if (deliveredSeqs.contains(rec.getSequenceNumber())) {
-                                failedRecords.add(rec);
-                            }
-                        }
-                        if (failedRecords.isEmpty()) {
-                            failedRecords = records.subList(outcome.lowestFailedIndex(), records.size());
-                        }
-                        sendToOnFailureDestination(esm, shardId, failedRecords, invokeResult, currentRetries);
-                        retryCounts.remove(nextBatchKey);
-                        advanceCheckpoint(esm, shardId, newestFetchedSeq);
+                        dispose(esm, shardId, nextBatchKey, new PendingFailure(failedRecords, invokeResult,
+                                currentRetries, "RetryAttemptsExhausted", newestFetchedSeq));
                     } else {
+                        retryNotBefore.put(nextBatchKey, now + retryBackoffMs(currentRetries));
                         LOG.warnv("DynamoDB Streams ESM {0}: Lambda returned error [batchItemFailures], retry {1}, records will be retried",
                                 esm.getUuid(), currentRetries);
                         advanceCheckpoint(esm, shardId, nextCheckpoint);
                     }
                 } else {
                     Integer maxRetries = esm.getMaximumRetryAttempts();
-                    int currentRetries = retryCounts.merge(batchKey, 1, Integer::sum);
-                    if (maxRetries != null && maxRetries >= 0 && currentRetries > maxRetries) {
+                    int currentRetries = retryCounts.getOrDefault(batchKey, 0) + 1;
+                    if (hasExceededMaximumRecordAge(esm, matched, now)) {
+                        LOG.warnv("DynamoDB Streams ESM {0}: maximum record age exceeded for batch ending at {1}",
+                                esm.getUuid(), newestFetchedSeq);
+                        clearBatchState(batchKey);
+                        dispose(esm, shardId, persistedKey, new PendingFailure(matched, invokeResult,
+                                currentRetries, "MaximumRecordAgeExceeded", newestFetchedSeq));
+                    } else if (invokeResult.getFunctionError() != null
+                            && Boolean.TRUE.equals(esm.getBisectBatchOnFunctionError()) && matched.size() > 1) {
+                        // ponytail: the halved limit is keyed by checkpoint, so once a good half advances the
+                        // rest is refetched at full batch size and split again. One window converges on the
+                        // poison record in O(log n) invocations, a busy stream in O(log^2 n) worst case;
+                        // carrying the right half's end sequence forward would match AWS exactly.
+                        int limit = (records.size() + 1) / 2;
+                        bisectLimits.put(batchKey, limit);
+                        LOG.infov("DynamoDB Streams ESM {0}: function error on {1} record(s), bisecting to {2}",
+                                esm.getUuid(), records.size(), limit);
+                    } else if (maxRetries != null && maxRetries >= 0 && currentRetries > maxRetries) {
                         LOG.warnv("DynamoDB Streams ESM {0}: maximum retry attempts ({1}) exhausted for batch ending at {2}",
                                 esm.getUuid(), maxRetries, newestFetchedSeq);
-                        sendToOnFailureDestination(esm, shardId, matched, invokeResult, currentRetries);
-                        retryCounts.remove(batchKey);
-                        advanceCheckpoint(esm, shardId, newestFetchedSeq);
+                        clearBatchState(batchKey);
+                        dispose(esm, shardId, persistedKey, new PendingFailure(matched, invokeResult,
+                                currentRetries, "RetryAttemptsExhausted", newestFetchedSeq));
                     } else {
+                        retryCounts.put(batchKey, currentRetries);
+                        retryNotBefore.put(batchKey, now + retryBackoffMs(currentRetries));
                         String error = invokeResult.getFunctionError() != null
                                 ? invokeResult.getFunctionError()
                                 : "batchItemFailures";
@@ -325,6 +433,37 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     }
 
     private record CheckpointOutcome(String checkpoint, int lowestFailedIndex) {}
+
+    private record PendingFailure(List<DynamoDbStreamRecord> records, InvokeResult invokeResult, int invokeCount,
+                                  String condition, String advanceTo) {}
+
+    /** Sends a discarded batch to its OnFailure destination and checkpoints past it. */
+    private void dispose(EventSourceMapping esm, String shardId, String key, PendingFailure failure) {
+        if (isStopped(esm)) {
+            clearBatchState(key);
+            return;
+        }
+        sendToOnFailureDestination(esm, shardId, failure.records(), failure.invokeResult(),
+                failure.invokeCount(), failure.condition());
+        clearBatchState(key);
+        advanceCheckpoint(esm, shardId, failure.advanceTo());
+    }
+
+    private void clearBatchState(String key) {
+        retryCounts.remove(key);
+        retryNotBefore.remove(key);
+        bisectLimits.remove(key);
+    }
+
+    private int bisectLimit(EventSourceMapping esm, String key) {
+        return Boolean.TRUE.equals(esm.getBisectBatchOnFunctionError())
+                ? bisectLimits.getOrDefault(key, Integer.MAX_VALUE)
+                : Integer.MAX_VALUE;
+    }
+
+    private static String batchStateKey(String uuid, String shardId, String sequence) {
+        return uuid + ":" + shardId + ":" + (sequence == null ? "TRIM_HORIZON" : sequence);
+    }
 
     /**
      * Returns the last record that can be consumed after a successful invocation. Floci stores the
@@ -399,10 +538,34 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         return previousCheckpoint;
     }
 
+    private boolean hasExceededMaximumRecordAge(EventSourceMapping esm, List<DynamoDbStreamRecord> records,
+                                                long now) {
+        Integer configuredAge = esm.getMaximumRecordAgeInSeconds();
+        if (configuredAge == null || configuredAge <= 0) {
+            return false;
+        }
+
+        long oldestRecordSeconds = records.stream()
+                .mapToLong(DynamoDbStreamRecord::getApproximateCreationDateTime)
+                .filter(seconds -> seconds > 0)
+                .min()
+                .orElse(0);
+        if (oldestRecordSeconds == 0) {
+            return false;
+        }
+        return now - oldestRecordSeconds * 1_000 >= configuredAge * 1_000L;
+    }
+
+    long retryBackoffMs(int retries) {
+        int doublings = Math.min(retries, 16);
+        return Math.min(pollIntervalMs * (1L << doublings), MAX_RETRY_BACKOFF_MS);
+    }
+
     private void sendToOnFailureDestination(EventSourceMapping esm, String shardId,
-                                           List<DynamoDbStreamRecord> records,
-                                           InvokeResult invokeResult,
-                                           int invokeCount) {
+                                            List<DynamoDbStreamRecord> records,
+                                            InvokeResult invokeResult,
+                                            int invokeCount,
+                                            String condition) {
         if (esm.getDestinationConfig() == null || esm.getDestinationConfig().getOnFailure() == null) {
             return;
         }
@@ -415,12 +578,12 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
             if (destinationArn.contains(":sqs:")) {
                 String region = AwsArnUtils.regionOrDefault(destinationArn, esm.getRegion());
                 String queueUrl = AwsArnUtils.arnToQueueUrl(destinationArn, baseUrl);
-                String payload = buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount);
+                String payload = buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition);
                 sqsService.sendMessage(queueUrl, payload, 0, region);
                 LOG.infov("DynamoDB Streams ESM {0}: sent failed batch to SQS DLQ {1}", esm.getUuid(), destinationArn);
             } else if (destinationArn.contains(":sns:")) {
                 String region = AwsArnUtils.regionOrDefault(destinationArn, esm.getRegion());
-                String payload = buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount);
+                String payload = buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition);
                 snsService.publish(destinationArn, null, payload, "ESM OnFailure", region);
                 LOG.infov("DynamoDB Streams ESM {0}: sent failed batch to SNS DLQ {1}", esm.getUuid(), destinationArn);
             } else if (destinationArn.contains(":s3:")) {
@@ -429,7 +592,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                     throw new IllegalArgumentException("Invalid S3 destination ARN: " + destinationArn);
                 }
                 String key = buildS3OnFailureKey(esm.getUuid(), shardId, Instant.now(), UUID.randomUUID());
-                String s3Payload = buildS3OnFailurePayload(esm, shardId, records, invokeResult, invokeCount);
+                String s3Payload = buildS3OnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition);
                 RequestScopes.runAs(esm.getAccountId(), () ->
                         s3Service.putObject(arn.resource(), key,
                                 s3Payload.getBytes(StandardCharsets.UTF_8),
@@ -437,11 +600,11 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
                 LOG.infov("DynamoDB Streams ESM {0}: sent failed batch to S3 bucket {1} with key {2}",
                         esm.getUuid(), arn.resource(), key);
             } else {
-                LOG.warnv("DynamoDB Streams ESM {0}: unsupported OnFailure destination ARN {1}",
+                LOG.warnv("DynamoDB Streams ESM {0}: unsupported OnFailure destination ARN {1}; discarding records",
                         esm.getUuid(), destinationArn);
             }
         } catch (Exception e) {
-            LOG.errorv("DynamoDB Streams ESM {0}: failed to send to OnFailure destination {1}: {2}",
+            LOG.errorv("DynamoDB Streams ESM {0}: failed to send to OnFailure destination {1}; discarding records: {2}",
                     esm.getUuid(), destinationArn, e.getMessage());
         }
     }
@@ -449,10 +612,11 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     private String buildS3OnFailurePayload(EventSourceMapping esm, String shardId,
                                             List<DynamoDbStreamRecord> records,
                                             InvokeResult invokeResult,
-                                            int invokeCount) {
+                                            int invokeCount,
+                                            String condition) {
         try {
             ObjectNode root = (ObjectNode) objectMapper.readTree(
-                    buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount));
+                    buildOnFailurePayload(esm, shardId, records, invokeResult, invokeCount, condition));
             root.put("payload", buildDynamoDbEvent(records, esm));
             return objectMapper.writeValueAsString(root);
         } catch (Exception e) {
@@ -469,7 +633,8 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
     private String buildOnFailurePayload(EventSourceMapping esm, String shardId,
                                          List<DynamoDbStreamRecord> records,
                                          InvokeResult invokeResult,
-                                         int invokeCount) {
+                                         int invokeCount,
+                                         String condition) {
         try {
             ObjectNode root = objectMapper.createObjectNode();
             root.put("version", "1.0");
@@ -478,7 +643,7 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
             ObjectNode requestContext = root.putObject("requestContext");
             requestContext.put("requestId", invokeResult.getRequestId() != null ? invokeResult.getRequestId() : "");
             requestContext.put("functionArn", esm.getFunctionArn() != null ? esm.getFunctionArn() : "");
-            requestContext.put("condition", "RetryAttemptsExhausted");
+            requestContext.put("condition", condition);
             requestContext.put("approximateInvokeCount", invokeCount);
 
             ObjectNode responseContext = root.putObject("responseContext");
@@ -558,8 +723,19 @@ public class DynamoDbStreamsEventSourcePoller implements Resettable {
         return item;
     }
 
-    private void advanceCheckpoint(EventSourceMapping esm, String shardId, String newestSeq) {
+    private synchronized void advanceCheckpoint(EventSourceMapping esm, String shardId, String newestSeq) {
+        if (isStopped(esm)) {
+            return;
+        }
         esm.getShardSequenceNumbers().put(shardId, newestSeq);
         esmStore.saveForAccount(esm.getAccountId(), esm);
+    }
+
+    private boolean isStopped(EventSourceMapping esm) {
+        return resetting || stopped.contains(esm.getUuid()) || !exists(esm);
+    }
+
+    private boolean exists(EventSourceMapping esm) {
+        return esmStore.getForAccount(esm.getAccountId(), esm.getUuid()).isPresent();
     }
 }

@@ -34,6 +34,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 @ApplicationScoped
 public class CloudTrailService {
@@ -674,7 +675,7 @@ public class CloudTrailService {
     }
 
     private boolean matchesAnyAdvancedSelector(List<AdvancedEventSelector> selectors, S3EventInput in) {
-        String arn = "arn:aws:s3:::" + in.bucketName() + (in.key() != null ? "/" + in.key() : "");
+        String arn = regionResolver.buildGlobalArn("s3", "", in.bucketName() + (in.key() != null ? "/" + in.key() : ""));
         // Bucket-level operations (e.g. ListObjects) have no object key and are reported
         // by CloudTrail as AWS::S3::Bucket resources, not AWS::S3::Object: matching real
         // AWS behavior, an AWS::S3::Object DataResource selector must never match them.
@@ -737,20 +738,21 @@ public class CloudTrailService {
         return values == null || values.isEmpty();
     }
 
+    private static final Pattern BARE_S3_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":s3");
+
     // Package-private for unit testing.
     static boolean matchesS3DataResourceArn(String configured, String bucketName, String key) {
         if (configured == null) return false;
-        // "arn:aws:s3" (bare, no ":::") is shorthand for all buckets + all objects.
-        if (configured.equals("arn:aws:s3")) return true;
-        // Forms accepted:
+        // "arn:<partition>:s3" (bare, no ":::") is shorthand for all buckets + all objects.
+        if (BARE_S3_ARN.matcher(configured).matches()) return true;
+        // Forms accepted, in any partition:
         //   arn:aws:s3:::                    → all buckets, all keys
         //   arn:aws:s3:::*                   → all buckets (wildcard)
         //   arn:aws:s3:::bucket/             → all keys in bucket
         //   arn:aws:s3:::bucket/prefix       → keys with the given prefix in bucket
         //   arn:aws:s3:::*/*                 → all objects (wildcard bucket + any key)
-        String prefix = "arn:aws:s3:::";
-        if (!configured.startsWith(prefix)) return false;
-        String tail = configured.substring(prefix.length());
+        String tail = AwsArnUtils.resourceIfArnFor(configured, "s3").orElse(null);
+        if (tail == null) return false;
         if (tail.isEmpty() || tail.equals("/")) {
             return true;
         }
@@ -829,12 +831,12 @@ public class CloudTrailService {
             ObjectNode bucketRes = mapper.createObjectNode();
             bucketRes.put("accountId", regionResolver.getAccountId());
             bucketRes.put("type", "AWS::S3::Bucket");
-            bucketRes.put("ARN", "arn:aws:s3:::" + in.bucketName());
+            bucketRes.put("ARN", regionResolver.buildGlobalArn("s3", "", in.bucketName()));
             resources.add(bucketRes);
             if (in.key() != null) {
                 ObjectNode objRes = mapper.createObjectNode();
                 objRes.put("type", "AWS::S3::Object");
-                objRes.put("ARN", "arn:aws:s3:::" + in.bucketName() + "/" + in.key());
+                objRes.put("ARN", regionResolver.buildGlobalArn("s3", "", in.bucketName() + "/" + in.key()));
                 resources.add(objRes);
             }
             record.set("resources", resources);
@@ -862,7 +864,7 @@ public class CloudTrailService {
         if (accessKeyId == null || "test".equals(accessKeyId)) {
             identity.put("type", "IAMUser");
             identity.put("principalId", "AIDA" + repeat('A', 17));
-            identity.put("arn", "arn:aws:iam::" + accountId + ":root");
+            identity.put("arn", regionResolver.buildGlobalArn("iam", accountId, "root"));
             identity.put("accountId", accountId);
             identity.put("accessKeyId", accessKeyId == null ? "" : accessKeyId);
             identity.put("userName", "root");
@@ -885,7 +887,7 @@ public class CloudTrailService {
 
         identity.put("type", "IAMUser");
         identity.put("principalId", "AIDA" + repeat('A', 17));
-        identity.put("arn", "arn:aws:iam::" + accountId + ":user/anonymous");
+        identity.put("arn", regionResolver.buildGlobalArn("iam", accountId, "user/anonymous"));
         identity.put("accountId", accountId);
         identity.put("accessKeyId", accessKeyId);
         identity.put("userName", "anonymous");

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.s3;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ContainerRequestFilter;
@@ -19,7 +20,9 @@ import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Provider
@@ -28,22 +31,41 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
     private static final Logger LOG = Logger.getLogger(PreSignedUrlFilter.class);
     private static final String LEGACY_ACCESS_KEY_ID = "test";
     private static final String LEGACY_SECRET_KEY = "test";
+    private static final Set<String> CHECKSUM_HEADERS_REQUIRING_SIGNATURE =
+            Set.of(
+                    "x-amz-checksum-algorithm",
+                    "x-amz-checksum-crc32",
+                    "x-amz-checksum-crc32c",
+                    "x-amz-checksum-crc64nvme",
+                    "x-amz-checksum-sha1",
+                    "x-amz-checksum-sha256",
+                    "x-amz-sdk-checksum-algorithm");
 
     private final PreSignedUrlGenerator presignGenerator;
     private final S3Service s3Service;
     private final IamService iamService;
+    private final CurrentVertxRequest currentVertxRequest;
 
     @Inject
     public PreSignedUrlFilter(PreSignedUrlGenerator presignGenerator,
                               S3Service s3Service,
-                              IamService iamService) {
+                              IamService iamService,
+                              CurrentVertxRequest currentVertxRequest) {
         this.presignGenerator = presignGenerator;
         this.s3Service = s3Service;
         this.iamService = iamService;
+        this.currentVertxRequest = currentVertxRequest;
     }
 
     @Override
     public void filter(ContainerRequestContext requestContext) {
+        // A browser preflight reuses the target request's presigned URL, so its OPTIONS method
+        // must not be verified against a signature created for the follow-up PUT/GET request.
+        // The dedicated S3 OPTIONS resource performs the bucket CORS evaluation instead.
+        if (isCorsPreflight(requestContext)) {
+            return;
+        }
+
         var queryParams = requestContext.getUriInfo().getQueryParameters();
 
         // Only process if this is a pre-signed URL request
@@ -124,6 +146,13 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             if (!verifySigV4Signature(requestContext, signature, secretKey)) {
                 requestContext.abortWith(errorResponse(403, "SignatureDoesNotMatch",
                         "The request signature we calculated does not match the signature you provided."));
+                return;
+            }
+
+            List<String> unsignedChecksumHeaders = unsignedChecksumHeaders(
+                    requestContext.getHeaders().keySet(), queryParams.getFirst("X-Amz-SignedHeaders"));
+            if (!unsignedChecksumHeaders.isEmpty()) {
+                requestContext.abortWith(headersNotSignedResponse(unsignedChecksumHeaders));
             }
         } else if (presignGenerator.shouldValidateSignatures()) {
             String path = requestContext.getUriInfo().getPath();
@@ -142,6 +171,16 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
                         "The request signature we calculated does not match the signature you provided."));
             }
         }
+    }
+
+    private static boolean isCorsPreflight(ContainerRequestContext requestContext) {
+        return "OPTIONS".equalsIgnoreCase(requestContext.getMethod())
+                && hasText(requestContext.getHeaderString("Origin"))
+                && hasText(requestContext.getHeaderString("Access-Control-Request-Method"));
+    }
+
+    private static boolean hasText(String value) {
+        return value != null && !value.isBlank();
     }
 
     private boolean verifySigV4Signature(ContainerRequestContext requestContext,
@@ -166,7 +205,8 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
             URI requestUri = requestContext.getProperty(S3VirtualHostFilter.ORIGINAL_REQUEST_URI_PROPERTY) instanceof URI uri
                     ? uri
                     : requestContext.getUriInfo().getRequestUri();
-            String authority = S3VirtualHostFilter.resolveHost(requestContext.getHeaderString("Host"), requestUri);
+            String authority = S3VirtualHostFilter.resolveHost(requestContext.getHeaderString("Host"),
+                    requestContext.getHeaderString("X-Forwarded-Host"), requestUri);
 
             StringBuilder canonicalHeaders = new StringBuilder();
             for (String header : signedHeaders.split(";")) {
@@ -178,8 +218,9 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
                 }
             }
 
-            // Canonical request
-            String path = requestUri.getRawPath();
+            // Canonical request: the wire path, since a leading-slash key travels (and is
+            // signed) as a double slash that JAX-RS would otherwise collapse.
+            String path = S3HeaderSignatureFilter.signedPath(currentVertxRequest, requestUri);
             String canonicalQueryString = buildCanonicalQueryString(queryParams);
             String payloadHash = requestContext.getHeaderString("x-amz-content-sha256");
             if (payloadHash == null) {
@@ -271,6 +312,21 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
         return value == null ? "" : value.trim().replaceAll(" +", " ");
     }
 
+    static List<String> unsignedChecksumHeaders(Set<String> requestHeaderNames, String signedHeaders) {
+        Set<String> normalizedSignedHeaders = List.of(signedHeaders.split(";"))
+                .stream()
+                .map(name -> name.toLowerCase(Locale.ROOT))
+                .collect(Collectors.toSet());
+
+        return requestHeaderNames.stream()
+                .map(name -> name.toLowerCase(Locale.ROOT))
+                .filter(CHECKSUM_HEADERS_REQUIRING_SIGNATURE::contains)
+                .filter(name -> !normalizedSignedHeaders.contains(name))
+                .distinct()
+                .sorted()
+                .toList();
+    }
+
     static String awsUriEncode(String value) {
         StringBuilder encoded = new StringBuilder();
         for (byte b : value.getBytes(StandardCharsets.UTF_8)) {
@@ -286,7 +342,8 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
         return encoded.toString();
     }
 
-    static Response errorResponse(int status, String code, String message) {
+    /** S3's XML error document; also the shape the ingress filter uses to refuse an S3-signed request. */
+    public static Response errorResponse(int status, String code, String message) {
         String xml = new XmlBuilder()
                 .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                 .start("Error")
@@ -295,5 +352,17 @@ public class PreSignedUrlFilter implements ContainerRequestFilter {
                 .end("Error")
                 .build();
         return Response.status(status).entity(xml).type(MediaType.APPLICATION_XML).build();
+    }
+
+    private static Response headersNotSignedResponse(List<String> headerNames) {
+        String xml = new XmlBuilder()
+                .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+                .start("Error")
+                  .elem("Code", "AccessDenied")
+                  .elem("Message", "There were headers present in the request which were not signed")
+                  .elem("HeadersNotSigned", String.join(",", headerNames))
+                .end("Error")
+                .build();
+        return Response.status(403).entity(xml).type(MediaType.APPLICATION_XML).build();
     }
 }

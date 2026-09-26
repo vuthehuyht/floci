@@ -10,7 +10,9 @@ Floci is configured exclusively through environment variables. Every option belo
 |---|---|---|
 | `FLOCI_BASE_URL` | `http://localhost:4566` | Base URL embedded in response fields (SQS `QueueUrl`, pre-signed URLs, etc.) |
 | `FLOCI_HOSTNAME` | _(none)_ | Overrides only the hostname part of `FLOCI_BASE_URL`. Set to the Compose service name (e.g. `floci`) so other containers can reach Floci by DNS |
-| `FLOCI_DEFAULT_REGION` | `us-east-1` | AWS region used in ARNs and API responses |
+| `FLOCI_DEFAULT_REGION` | `us-east-1` | AWS region used in ARNs and API responses when a request names none. Also selects the deployment's partition (`cn-north-1` means `aws-cn`), see [AWS Partitions](./partitions.md) |
+| `FLOCI_PARTITIONS_ID` | _(derived)_ | Pins the partition (`aws`, `aws-cn`, `aws-us-gov`, `aws-iso`, `aws-iso-b`, `aws-iso-e`, `aws-iso-f`, `aws-eusc`). Startup refuses a value that contradicts `FLOCI_DEFAULT_REGION` |
+| `FLOCI_PARTITIONS_ALLOW_UNKNOWN_REGIONS` | `false` | Accept a request signed for a region no AWS partition publishes or admits by its region pattern (`polygondwanaland-west-1`), giving the label its own namespace. Off, such a request is refused with a 400, as moto and LocalStack refuse it. See [AWS Partitions](./partitions.md#which-partition-a-request-belongs-to) |
 | `FLOCI_DEFAULT_ACCOUNT_ID` | `000000000000` | Fallback account ID used in ARNs when the request's access key is not exactly 12 digits. When the access key IS 12 digits, it is used directly as the account ID — see [Multi-Account Isolation](./multi-account.md) |
 | `FLOCI_DEFAULT_AVAILABILITY_ZONE` | `us-east-1a` | Availability zone reported in EC2 and other responses |
 
@@ -22,6 +24,21 @@ Floci is configured exclusively through environment variables. Every option belo
 |---|---|---|
 | `FLOCI_AUTH_VALIDATE_SIGNATURES` | `false` | When `true`, verifies S3 presigned URL signatures |
 | `FLOCI_AUTH_PRESIGN_SECRET` | `local-emulator-secret` | Secret used to sign and verify pre-signed URLs |
+
+## Network Exposure
+
+| Variable | Default | Description |
+|---|---|---|
+| `QUARKUS_HTTP_HOST` | `127.0.0.1` | Address Floci listens on. With TLS enabled, the proxy serving HTTP and HTTPS on `FLOCI_PORT` listens here |
+| `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE` | `false` | Allow listening outside loopback (`127.0.0.0/8`, `::1`, `localhost`). Without it, Floci refuses to start on any other address |
+
+Anyone who can reach Floci's port can call its APIs. The Docker images listen on `0.0.0.0` inside the container and pass both settings in their default command, so who can reach Floci depends on how you publish the port. Publish it on loopback unless other machines need it:
+
+```bash
+docker run --rm -p 127.0.0.1:4566:4566 floci/floci:latest
+```
+
+Running Floci directly on a Linux host (not in a container) with services that start containers, such as Lambda functions or ECS tasks, needs a non-loopback address. Those containers reach Floci through `host.docker.internal`, which resolves to the Docker bridge gateway (`172.17.0.1` by default) rather than to the host's loopback. Set `QUARKUS_HTTP_HOST=0.0.0.0` and `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`, and keep port 4566 closed to other networks with a firewall. See also [Lambda on native Linux Docker](../getting-started/quick-start.md#lambda-on-native-linux-docker-ufw).
 
 ## Browser CORS
 
@@ -66,7 +83,7 @@ See [TLS / HTTPS](./tls.md) for SDK configuration examples and WebSocket (`wss:/
 | `FLOCI_STORAGE_PERSISTENT_PATH` | `./data` | Container-side directory for persistent and hybrid storage |
 | `FLOCI_STORAGE_HOST_PERSISTENT_PATH` | `./data` | Host-side path for Docker volume bind-mounts (RDS, OpenSearch, MSK, ECR data). When unset, Floci uses named Docker volumes |
 | `FLOCI_STORAGE_PRUNE_VOLUMES_ON_DELETE` | `false` | Remove named Docker volumes immediately when the resource is deleted |
-| `FLOCI_STORAGE_WAL_COMPACTION_INTERVAL_MS` | `30000` | How often (ms) the WAL compaction runs. Only applies when `FLOCI_STORAGE_MODE=wal` |
+| `FLOCI_STORAGE_WAL_COMPACTION_INTERVAL_MS` | `30000` | How often (ms) the WAL compaction runs. Applies to `wal` mode and to the stores that are journaled under `persistent` mode (CloudWatch Logs events) |
 
 ### Per-service storage overrides
 
@@ -85,8 +102,12 @@ See [Storage Modes](./storage.md) for a full explanation of each mode.
 
 ## Docker Daemon
 
+This foundation release provides opt-in security-group filtering for EC2 Docker instances and ECS `awsvpc` tasks. A rootful Linux Docker daemon with nftables support is required. Before enabling it, terminate existing EC2 instances and ECS tasks, then launch replacements so their namespaces are prepared before application code starts. Restart Floci after changing this setting. Mock mode remains a control-plane simulation and does not filter packets.
+
 | Variable | Default | Description |
 |---|---|---|
+| `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED` | `false` | Opt in to filtering Docker-backed EC2 and ECS `awsvpc` traffic by attached security groups |
+| `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_HELPER_IMAGE` | `floci/network-helper:local` | Linux helper image containing nftables; Floci builds the default image locally when missing |
 | `FLOCI_DOCKER_DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker daemon socket path or TCP address |
 | `FLOCI_DOCKER_DOCKER_CONFIG_PATH` | _(none)_ | Path to a directory containing Docker's `config.json` for registry auth |
 | `FLOCI_DOCKER_IMAGE_REGISTRY_BASE` | _(none)_ | Optional registry/repository base for every Docker image Floci launches. When set, `postgres:16-alpine` resolves as `<base>/postgres:16-alpine` and `public.ecr.aws/docker/library/ubuntu:24.04` resolves as `<base>/public.ecr.aws/docker/library/ubuntu:24.04` |
@@ -201,6 +222,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED` | `false` | Watch Lambda code directories for changes and reload without redeployment |
 | `FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ALLOWED_PATHS` | _(none)_ | Comma-separated host paths that hot-reload is allowed to watch |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | _(none)_ | Docker network for Lambda containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
+| `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | _(none)_ | Additional Docker flags applied to Lambda containers, such as `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Published ports support `host:container` and `127.0.0.1:host:container` forms |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for Lambda-spawned containers and code volumes (must match `[A-Za-z0-9][A-Za-z0-9_.-]*`) |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | _(none)_ | Explicit host/IP Lambda containers use to reach the Runtime API, bypassing auto-detection (e.g. rootless Podman) |
 | `FLOCI_SERVICES_LAMBDA_AWS_CONFIG_PATH` | _(none)_ | Host path bind-mounted read-only at `/opt/aws-config` inside Lambda containers for real credential discovery |
@@ -365,9 +387,11 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_RDS_PROXY_BASE_PORT` | `7001` | First port in the RDS proxy range |
 | `FLOCI_SERVICES_RDS_PROXY_MAX_PORT` | `7099` | Last port in the RDS proxy range |
 | `FLOCI_SERVICES_RDS_ENDPOINT_HOST` | _(auto-detected)_ | Hostname advertised in RDS endpoints; when set in Docker, Floci advertises each proxy's published host port |
+| `FLOCI_SERVICES_RDS_IAM_TOKEN_ENDPOINT_BINDING` | `true` | Refuse a PostgreSQL IAM auth token generated for another hostname, port or region than the endpoint publishes, as RDS does; set `false` to accept such tokens. MySQL and MariaDB always refuse them |
 | `FLOCI_SERVICES_RDS_DEFAULT_POSTGRES_IMAGE` | `postgres:16-alpine` | Default PostgreSQL Docker image |
 | `FLOCI_SERVICES_RDS_DEFAULT_MYSQL_IMAGE` | `mysql:8.0` | Default MySQL Docker image |
 | `FLOCI_SERVICES_RDS_DEFAULT_MARIADB_IMAGE` | `mariadb:11` | Default MariaDB Docker image |
+| `FLOCI_SERVICES_RDS_DEFAULT_SQL_SERVER_IMAGE` | `mcr.microsoft.com/mssql/server:2022-latest` | Default SQL Server Docker image |
 | `FLOCI_SERVICES_RDS_DOCKER_NETWORK` | _(none)_ | Docker network for RDS containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
 | `FLOCI_SERVICES_RDS_DATA_ENABLED` | `true` | Enable the RDS Data API service. Requires `FLOCI_SERVICES_RDS_ENABLED=true` |
 | `FLOCI_SERVICES_RDS_DATA_TRANSACTION_TTL_SECONDS` | `180` | Idle timeout, in seconds, before leaked RDS Data API transactions expire |
@@ -417,7 +441,7 @@ These services spawn Docker containers. They require access to the Docker socket
 |---|---|---|
 | `FLOCI_SERVICES_ECR_ENABLED` | `true` | Enable the ECR service |
 | `FLOCI_SERVICES_ECR_REGISTRY_IMAGE` | `registry:2` | Docker image for the ECR registry sidecar |
-| `FLOCI_SERVICES_ECR_REGISTRY_CONTAINER_NAME` | `floci-ecr-registry` | Name of the ECR registry sidecar container |
+| `FLOCI_SERVICES_ECR_REGISTRY_CONTAINER_NAME` | `floci-ecr-registry` | Name of the ECR registry sidecar container. The naming helper normalises it to `floci-aws-ecr-registry` |
 | `FLOCI_SERVICES_ECR_REGISTRY_BASE_PORT` | `5100` | First private loopback port for the backing registry |
 | `FLOCI_SERVICES_ECR_REGISTRY_MAX_PORT` | `5199` | Last private loopback port for the backing registry |
 | `FLOCI_SERVICES_ECR_TLS_ENABLED` | `false` | Enable TLS for the ECR registry |
@@ -434,6 +458,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EKS_MOCK` | `false` | When `true`, clusters are created instantly without a real container |
 | `FLOCI_SERVICES_EKS_PROVIDER` | `k3s` | Kubernetes provider (`k3s`) |
 | `FLOCI_SERVICES_EKS_DEFAULT_IMAGE` | `rancher/k3s:latest` | Docker image for EKS clusters |
+| `FLOCI_SERVICES_EKS_IMAGE_TEMPLATE` | _(none)_ | Format string for custom k3s images (e.g. `myrepo/k3s:v%s`), taking cluster version |
 | `FLOCI_SERVICES_EKS_API_SERVER_BASE_PORT` | `6500` | First port in the Kubernetes API server range |
 | `FLOCI_SERVICES_EKS_API_SERVER_MAX_PORT` | `6599` | Last port in the Kubernetes API server range |
 | `FLOCI_SERVICES_EKS_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Keep EKS containers running when Floci stops |
@@ -445,6 +470,7 @@ These services spawn Docker containers. They require access to the Docker socket
 |---|---|---|
 | `FLOCI_SERVICES_ECS_ENABLED` | `true` | Enable the ECS service |
 | `FLOCI_SERVICES_ECS_MOCK` | `false` | When `true`, tasks are registered but not actually run |
+| `FLOCI_SERVICES_ECS_PUBLISH_AWSVPC_PORTS_TO_HOST` | `false` | Publish `awsvpc` task ports on stable Docker host ports for host-side clients |
 | `FLOCI_SERVICES_ECS_DEFAULT_MEMORY_MB` | `512` | Default task memory when not specified in the task definition |
 | `FLOCI_SERVICES_ECS_DEFAULT_CPU_UNITS` | `256` | Default task CPU units when not specified in the task definition |
 | `FLOCI_SERVICES_ECS_DOCKER_NETWORK` | _(none)_ | Docker network for ECS task containers |
@@ -457,6 +483,7 @@ These services spawn Docker containers. They require access to the Docker socket
 |---|---|---|
 | `FLOCI_SERVICES_EC2_ENABLED` | `true` | Enable the EC2 service |
 | `FLOCI_SERVICES_EC2_MOCK` | `false` | When `true`, instances are registered in state but no containers are spawned |
+| `FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` | (unset) | Path to a complete YAML image catalog replacing the bundled EC2 catalog; mount the file at this path when running in Docker |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Port for the EC2 Instance Metadata Service (IMDS) endpoint |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | First port in the SSH port range for EC2 instances |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | Last port in the SSH port range |
@@ -482,6 +509,7 @@ Floci starts the web console as a sidecar container the first time `/_floci/ui` 
 | `FLOCI_SERVICES_UI_IMAGE` | `floci/floci-ui:latest` | Console image to run |
 | `FLOCI_SERVICES_UI_CONTAINER_NAME` | `floci-ui` | Name of the sidecar container |
 | `FLOCI_SERVICES_UI_PORT` | `4500` | Host port the console is published on |
+| `FLOCI_SERVICES_UI_BIND_ADDRESS` | _(none)_ | Host interface that port is published on. Unset publishes on every interface; set `127.0.0.1` when Floci's own port is loopback-only |
 | `FLOCI_SERVICES_UI_KEEP_RUNNING_ON_SHUTDOWN` | `false` | Leave the sidecar running when Floci stops |
 | `FLOCI_SERVICES_UI_DOCKER_NETWORK` | _(none)_ | Docker network for the sidecar (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
 | `FLOCI_SERVICES_UI_ENDPOINT` | _(derived)_ | Floci endpoint handed to the console, instead of deriving it from the Docker host and TLS settings |
@@ -522,6 +550,7 @@ See [Web Console](../ui/index.md) for running the console and swapping in a thir
 | `FLOCI_SERVICES_CODEBUILD_ENABLED` | `true` | Enable the CodeBuild service |
 | `FLOCI_SERVICES_CODEBUILD_DOCKER_NETWORK` | _(none)_ | Docker network for CodeBuild build containers |
 | `FLOCI_SERVICES_CODEDEPLOY_ENABLED` | `true` | Enable the CodeDeploy service |
+| `FLOCI_SERVICES_CODEPIPELINE_SOURCE_POLL_INTERVAL_MS` | `500` | How often (ms) the CodePipeline S3 source poller checks a configured `S3Bucket`/`S3ObjectKey` for a new object revision |
 | `FLOCI_SERVICES_NETWORKFIREWALL_ENABLED` | `true` | Enable the AWS Network Firewall service |
 | `FLOCI_SERVICES_SERVICEQUOTAS_ENABLED` | `true` | Enable the Service Quotas service |
 | `FLOCI_SERVICES_RAM_ENABLED` | `true` | Enable the AWS RAM service |

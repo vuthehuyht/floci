@@ -33,9 +33,21 @@ import io.github.hectorvent.floci.services.oam.OamController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontServingController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
+import io.github.hectorvent.floci.services.ses.SesAccountController;
+import io.github.hectorvent.floci.services.ses.SesConfigurationSetController;
 import io.github.hectorvent.floci.services.ses.SesContactController;
-import io.github.hectorvent.floci.services.ses.SesController;
+import io.github.hectorvent.floci.services.ses.SesCvetController;
+import io.github.hectorvent.floci.services.ses.SesDedicatedIpController;
+import io.github.hectorvent.floci.services.ses.SesExportJobController;
+import io.github.hectorvent.floci.services.ses.SesIdentityController;
+import io.github.hectorvent.floci.services.ses.SesImportJobController;
+import io.github.hectorvent.floci.services.ses.SesInsightsController;
+import io.github.hectorvent.floci.services.ses.SesMetricsController;
+import io.github.hectorvent.floci.services.ses.SesSendController;
+import io.github.hectorvent.floci.services.ses.SesSuppressionController;
+import io.github.hectorvent.floci.services.ses.SesTagController;
 import io.github.hectorvent.floci.services.ses.SesTemplateController;
+import io.github.hectorvent.floci.services.ses.SesTenantController;
 import io.github.hectorvent.floci.services.appsync.AppSyncController;
 import io.github.hectorvent.floci.services.rdsdata.RdsDataController;
 import io.github.hectorvent.floci.services.guardduty.GuardDutyController;
@@ -47,6 +59,7 @@ import io.github.hectorvent.floci.services.securityhub.SecurityHubController;
 import io.github.hectorvent.floci.services.ssooidc.SsoOidcController;
 import io.github.hectorvent.floci.services.ssoportal.SsoPortalController;
 import io.github.hectorvent.floci.services.detective.DetectiveController;
+import io.github.hectorvent.floci.services.dlm.DlmController;
 import io.github.hectorvent.floci.services.aps.ApsController;
 import io.github.hectorvent.floci.services.controlcatalog.ControlCatalogController;
 import io.github.hectorvent.floci.services.controltower.ControlTowerControlController;
@@ -59,6 +72,7 @@ import io.github.hectorvent.floci.services.marketplace.MarketplaceCatalogControl
 import io.github.hectorvent.floci.services.marketplace.MarketplaceDeploymentController;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceDiscoveryController;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceReportingController;
+import io.github.hectorvent.floci.services.sagemaker.SageMakerRuntimeController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -175,7 +189,7 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.QUERY),
                         Set.of(), Set.of("neptune"), Set.of(), Set.of()),
                 descriptor("docdb", "docdb", config.services().docdb().enabled(), true,
-                        "docdb", config.storage().mode(),                        
+                        "docdb", config.storage().mode(),
                         5000L, AwsNamespaces.RDS, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),
                         Set.of(), Set.of("docdb"), Set.of(), Set.of()),
@@ -189,6 +203,11 @@ public class ResolvedServiceCatalog {
                         "redshift-data", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("RedshiftData."), Set.of("redshift-data"), Set.of(), Set.of()),
+                descriptor("redshift-serverless", "redshift-serverless",
+                        config.services().redshiftServerless().enabled(), true,
+                        "redshiftserverless", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("RedshiftServerless."), Set.of("redshift-serverless"), Set.of(), Set.of()),
 
                 descriptor("events", "eventbridge", config.services().eventbridge().enabled(), true,
                         "eventbridge", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
@@ -287,8 +306,15 @@ public class ResolvedServiceCatalog {
                         "ses", config.storage().mode(), 5000L, AwsNamespaces.SES, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON, ServiceProtocol.QUERY),
                         Set.of(), Set.of("email", "ses", "sesv2"), Set.of(),
-                        Set.of(SesController.class, SesContactController.class,
-                                SesTemplateController.class)),
+                        Set.of(SesAccountController.class, SesConfigurationSetController.class,
+                                SesContactController.class, SesCvetController.class,
+                                SesDedicatedIpController.class, SesExportJobController.class,
+                                SesIdentityController.class,
+                                SesInsightsController.class, SesMetricsController.class,
+                                SesSendController.class,
+                                SesSuppressionController.class, SesTagController.class,
+                                SesTemplateController.class, SesImportJobController.class,
+                                SesTenantController.class)),
                 descriptor("es", "opensearch", config.services().opensearch().enabled(), true,
                         "opensearch", storageMode(config.storage().services().opensearch().mode(), config.storage().mode()),
                         config.storage().services().opensearch().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
@@ -401,6 +427,12 @@ public class ResolvedServiceCatalog {
                         config.storage().services().batch().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("batch"), Set.of(), Set.of(BatchController.class)),
+                descriptor("sagemaker", "sagemaker", config.services().sagemaker().enabled(), true,
+                        "sagemaker", storageMode(config.storage().services().sagemaker().mode(), config.storage().mode()),
+                        config.storage().services().sagemaker().flushIntervalMs(), null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON, ServiceProtocol.REST_JSON),
+                        Set.of("SageMaker."), Set.of("sagemaker", "runtime.sagemaker"), Set.of(),
+                        Set.of(SageMakerRuntimeController.class)),
                 descriptor("codedeploy", "codedeploy", config.services().codedeploy().enabled(), true,
                         "codedeploy", storageMode(config.storage().services().codedeploy().mode(), config.storage().mode()),
                         config.storage().services().codedeploy().flushIntervalMs(), null, ServiceProtocol.JSON,
@@ -564,6 +596,11 @@ public class ResolvedServiceCatalog {
                         "bcmpricingcalculator", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("AWSBCMPricingCalculator."), Set.of("bcm-pricing-calculator"), Set.of(), Set.of()),
+                descriptor("timestream-influxdb", "timestreaminfluxdb",
+                        config.services().timestreamInfluxdb().enabled(), true,
+                        "timestreaminfluxdb", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("AmazonTimestreamInfluxDB."), Set.of("timestream-influxdb"), Set.of(), Set.of()),
                 descriptor("bcm-data-exports", "bcmdataexports", config.services().bcmDataExports().enabled(), true,
                         "bcmdataexports", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -640,6 +677,10 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("app-integrations"), Set.of(),
                         Set.of(io.github.hectorvent.floci.services.appintegrations.AppIntegrationsController.class)),
+                descriptor("dlm", "dlm", config.services().dlm().enabled(), true,
+                        "dlm", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("dlm"), Set.of(), Set.of(DlmController.class)),
                 descriptor("cognito-identity", "cognitoidentity",
                         config.services().cognitoidentity().enabled(), true,
                         "cognitoidentity", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
@@ -695,6 +736,11 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("codeguru-reviewer"), Set.of(),
                         Set.of(io.github.hectorvent.floci.services.codegurureviewer.CodeGuruReviewerController.class)),
+                descriptor("codeartifact", "codeartifact", config.services().codeartifact().enabled(), true,
+                        "codeartifact", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("codeartifact"), Set.of(),
+                        Set.of(io.github.hectorvent.floci.services.codeartifact.CodeArtifactController.class)),
                 descriptor("verifiedpermissions", "verifiedpermissions", config.services().verifiedpermissions().enabled(), true,
                         "verifiedpermissions", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
@@ -703,7 +749,11 @@ public class ResolvedServiceCatalog {
                         "marketplace", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON, ServiceProtocol.JSON, ServiceProtocol.CBOR),
                         Set.of("AWSMPCommerceService_v20200301.", "AWSMPEntitlementService.", "AWSMPMeteringService."), Set.of("aws-marketplace"), Set.of("AWS Marketplace Entitlement Service"),
-                        Set.of(MarketplaceCatalogController.class, MarketplaceDeploymentController.class, MarketplaceReportingController.class, MarketplaceDiscoveryController.class))
+                        Set.of(MarketplaceCatalogController.class, MarketplaceDeploymentController.class, MarketplaceReportingController.class, MarketplaceDiscoveryController.class)),
+                descriptor("dms", "dms", config.services().dms().enabled(), true,
+                        "dms", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
+                        protocols(ServiceProtocol.JSON),
+                        Set.of("AmazonDMSv20160101."), Set.of("dms"), Set.of(), Set.of())
         ));
     }
 

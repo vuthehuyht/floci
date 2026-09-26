@@ -858,6 +858,135 @@ class DynamoDbIntegrationTest {
 
     @Test
     @Order(10)
+    void batchGetItemWithEmptyRequestItemsFails() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.BatchGetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"RequestItems": {}}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("1 validation error detected: Value at 'RequestItems' failed to satisfy "
+                    + "constraint: Member must have length greater than or equal to 1"));
+    }
+
+    @Test
+    @Order(10)
+    void batchWriteItemWithEmptyRequestItemsFails() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.BatchWriteItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {"RequestItems": {}}
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("The requestItems parameter is required for BatchWriteItem"));
+    }
+
+    @Test
+    @Order(10)
+    void deleteItemWithExpectedAndConditionExpressionFails() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DeleteItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "TestTable",
+                    "Key": {"pk": {"S": "user-1"}, "sk": {"S": "profile"}},
+                    "Expected": {"pk": {"Exists": false}},
+                    "ConditionExpression": "attribute_not_exists(pk)"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Can not use both expression and non-expression parameters in the same request: "
+                    + "Non-expression parameters: {Expected} Expression parameters: {ConditionExpression}"));
+    }
+
+    @Test
+    @Order(10)
+    void batchGetItemWithProjectionExpressionAndAttributesToGetFails() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.BatchGetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "RequestItems": {
+                        "TestTable": {
+                            "Keys": [{"pk": {"S": "user-1"}, "sk": {"S": "profile"}}],
+                            "ProjectionExpression": "pk",
+                            "AttributesToGet": ["pk"]
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Can not use both expression and non-expression parameters in the same request: "
+                    + "Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"));
+    }
+
+    @Test
+    @Order(10)
+    void batchGetItemMixingProjectionStylesAcrossTablesFails() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "BatchGetMixTable",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.BatchGetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "RequestItems": {
+                        "TestTable": {
+                            "Keys": [{"pk": {"S": "user-1"}, "sk": {"S": "profile"}}],
+                            "ProjectionExpression": "pk"
+                        },
+                        "BatchGetMixTable": {
+                            "Keys": [{"pk": {"S": "user-1"}}],
+                            "AttributesToGet": ["pk"]
+                        }
+                    }
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Can not use both expression and non-expression parameters in the same request: "
+                    + "Non-expression parameters: {AttributesToGet} Expression parameters: {ProjectionExpression}"));
+    }
+
+    @Test
+    @Order(10)
     void queryWithQueryFilterAndKeyConditionExpressionFails() {
         given()
             .header("X-Amz-Target", "DynamoDB_20120810.Query")
@@ -1406,6 +1535,47 @@ class DynamoDbIntegrationTest {
         .then()
             .statusCode(200)
             .body("TableDescription.TableStatus", equalTo("ACTIVE"));
+    }
+
+    @Test
+    @Order(26)
+    void transactWriteItemsRejectsRedundantConditionParentheses() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.TransactWriteItems")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TransactItems": [{
+                        "Put": {
+                            "TableName": "TestTable",
+                            "Item": {"pk": {"S": "transaction-parens"}, "sk": {"S": "row"}},
+                            "ConditionExpression": "((attribute_not_exists(pk)))"
+                        }
+                    }]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo(
+                    "Invalid ConditionExpression: The expression has redundant parentheses;"));
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.GetItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "TestTable",
+                    "Key": {"pk": {"S": "transaction-parens"}, "sk": {"S": "row"}}
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Item", nullValue());
     }
 
     // --- Cleanup ---
@@ -3338,7 +3508,7 @@ given()
     @Test
     void unsupportedOperation() {
         given()
-            .header("X-Amz-Target", "DynamoDB_20120810.CreateGlobalTable")
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeGlobalTableSettings")
             .contentType(DYNAMODB_CONTENT_TYPE)
             .body("{}")
         .when()

@@ -3,18 +3,20 @@ package io.github.hectorvent.floci.services.ses;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ses.model.Tag;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Request-parsing helpers shared by the SES v2 REST JSON controllers: body and member shape checks
- * that answer with the probe-confirmed {@code BadRequestException} / {@code SerializationException}
- * wordings, the resource {@code Tags} array, and the v1-to-v2 error remapping applied at the v2
- * boundary. Stateless by design so every controller can call them without a bean; the one helper
- * that reads a body takes the caller's {@link ObjectMapper}.
+ * Helpers shared by the SES v2 REST JSON controllers: body and member shape checks that answer
+ * with the probe-confirmed {@code BadRequestException} / {@code SerializationException} wordings,
+ * the resource {@code Tags} array, the v1-to-v2 error remapping applied at the v2 boundary, and the
+ * epoch-seconds timestamp members of a response. Stateless by design so every controller can call
+ * them without a bean; the one helper that reads a body takes the caller's {@link ObjectMapper}.
  */
 final class SesV2Json {
 
@@ -199,5 +201,69 @@ final class SesV2Json {
             throw new AwsException("BadRequestException", fieldName + " is required.", 400);
         }
         return node.asText();
+    }
+
+    /**
+     * Parses a {@code SuppressedReasons} JSON array into a list, validating
+     * structure only; reason values are validated by the service layer.
+     * Structural violations reproduce the AWS deserialization-layer errors
+     * (verified against real AWS SES V2 on 2026-06-13): a non-array node and
+     * non-string scalar / container elements fail with
+     * {@code SerializationException}, while {@code null} elements pass
+     * deserialization and are rejected by the service-layer value validation,
+     * exactly as AWS does. Missing / null yields an empty list for the PUT
+     * path, which AWS treats as an explicit empty override.
+     */
+    static List<String> parseSuppressedReasons(JsonNode reasonsNode) {
+        List<String> reasons = new ArrayList<>();
+        if (!reasonsNode.isMissingNode() && !reasonsNode.isNull()) {
+            if (!reasonsNode.isArray()) {
+                throw new AwsException("SerializationException", "Expected list or null", 400);
+            }
+            for (JsonNode r : reasonsNode) {
+                if (r.isTextual() || r.isNull()) {
+                    reasons.add(r.asText(null));
+                } else if (r.isNumber()) {
+                    throw new AwsException("SerializationException",
+                            "NUMBER_VALUE can not be converted to a String", 400);
+                } else if (r.isBoolean()) {
+                    throw new AwsException("SerializationException",
+                            (r.booleanValue() ? "TRUE_VALUE" : "FALSE_VALUE")
+                                    + " can not be converted to a String", 400);
+                } else {
+                    throw unexpectedStartError(r);
+                }
+            }
+        }
+        return reasons;
+    }
+
+    /**
+     * Reproduces the AWS deserialization behavior for {@code SendingEnabled}
+     * (verified against real AWS SES V2 on 2026-06-13): a missing member
+     * defaults to {@code false}, any string coerces to {@code true}, and
+     * explicit {@code null} or non-boolean scalars fail with
+     * {@code SerializationException}.
+     */
+    static boolean parseSendingEnabled(JsonNode enabledNode) {
+        if (enabledNode.isMissingNode()) {
+            return false;
+        }
+        return coerceBoolean(enabledNode);
+    }
+
+    /**
+     * Epoch seconds with the millisecond fraction, the shape AWS returns for every SES v2
+     * timestamp (probe-confirmed, e.g. {@code 1.790312384592E9}). It must stay a JSON number: an
+     * ISO string, as the v1 Query path writes, breaks the SDK's unixTimestamp unmarshaller.
+     */
+    static double epochSeconds(Instant instant) {
+        return instant.toEpochMilli() / 1000.0;
+    }
+
+    static void putTimestamp(ObjectNode node, String field, Instant value) {
+        if (value != null) {
+            node.put(field, epochSeconds(value));
+        }
     }
 }

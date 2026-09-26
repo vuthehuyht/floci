@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.bedrockagentcorecontrol;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
@@ -106,7 +107,7 @@ public class BedrockAgentCoreToolsService {
                     "name must match [a-zA-Z][a-zA-Z0-9_]{0,47}", 400);
         }
         validateDescription(request.get("description"));
-        validateTags(request.get("tags"));
+        BedrockAgentCoreTagValidation.validateTags(request.get("tags"));
         String clientToken = optionalText(request, "clientToken");
         if (clientToken != null) {
             if (clientToken.length() < 33 || clientToken.length() > 256
@@ -176,8 +177,8 @@ public class BedrockAgentCoreToolsService {
         if ("aws.codeinterpreter.v1".equals(codeInterpreterId)) {
             ObjectNode interpreter = com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
             interpreter.put("codeInterpreterId", codeInterpreterId);
-            interpreter.put("codeInterpreterArn", "arn:aws:bedrock-agentcore:" + region
-                    + ":aws:code-interpreter/aws.codeinterpreter.v1");
+            interpreter.put("codeInterpreterArn", AwsArnUtils.Arn.of("bedrock-agentcore", region, "aws",
+                    "code-interpreter/aws.codeinterpreter.v1").toString());
             interpreter.put("name", codeInterpreterId);
             interpreter.put("status", "READY");
             interpreter.put("createdAt", "1970-01-01T00:00:00Z");
@@ -345,7 +346,7 @@ public class BedrockAgentCoreToolsService {
 
     private static void validateCommonCreateFields(ObjectNode request, boolean browser) {
         validateDescription(request.get("description"));
-        validateTags(request.get("tags"));
+        BedrockAgentCoreTagValidation.validateTags(request.get("tags"));
         JsonNode executionRoleArn = request.get("executionRoleArn");
         if (executionRoleArn != null && !executionRoleArn.isNull()) {
             if (!executionRoleArn.isTextual()) {
@@ -353,7 +354,7 @@ public class BedrockAgentCoreToolsService {
             }
             String arn = executionRoleArn.asText();
             if (arn.length() < 1 || arn.length() > 2048
-                    || !arn.matches("arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+")) {
+                    || !arn.matches("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::([0-9]{12})?:role/.+")) {
                 throw new AwsException("ValidationException", "executionRoleArn is invalid", 400);
             }
         }
@@ -382,29 +383,6 @@ public class BedrockAgentCoreToolsService {
             throw new AwsException("ValidationException",
                     field + " must contain between " + min + " and " + max + " items", 400);
         }
-    }
-
-    private static void validateTags(JsonNode tags) {
-        if (tags == null || tags.isNull()) {
-            return;
-        }
-        if (!tags.isObject() || tags.size() > 50) {
-            throw new AwsException("ValidationException", "tags must be an object with at most 50 entries", 400);
-        }
-        tags.fields().forEachRemaining(entry -> {
-            String key = entry.getKey();
-            JsonNode rawValue = entry.getValue();
-            if (key.length() < 1 || key.length() > 128 || !key.matches("[a-zA-Z0-9\\s._:/=+@-]*")) {
-                throw new AwsException("ValidationException", "tag key does not satisfy AgentCore constraints", 400);
-            }
-            if (!rawValue.isTextual()) {
-                throw new AwsException("ValidationException", "tag value must be a string", 400);
-            }
-            String value = rawValue.asText();
-            if (value.length() > 256 || !value.matches("[a-zA-Z0-9\\s._:/=+@-]*")) {
-                throw new AwsException("ValidationException", "tag value does not satisfy AgentCore constraints", 400);
-            }
-        });
     }
 
     private static void validateNetworkConfiguration(JsonNode networkConfiguration, boolean codeInterpreter) {

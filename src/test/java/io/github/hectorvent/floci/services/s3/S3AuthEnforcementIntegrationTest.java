@@ -1,9 +1,10 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.testing.S3EnforceAuthProfile;
 import io.github.hectorvent.floci.testutil.S3RequestSigner;
+import io.restassured.specification.RequestSpecification;
 import io.quarkus.test.junit.QuarkusTest;
-import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.MethodOrderer;
@@ -34,7 +35,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.not;
 
 @QuarkusTest
-@TestProfile(S3AuthEnforcementIntegrationTest.S3AuthProfile.class)
+@TestProfile(S3EnforceAuthProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class S3AuthEnforcementIntegrationTest {
 
@@ -665,6 +666,49 @@ class S3AuthEnforcementIntegrationTest {
         .then()
             .statusCode(403)
             .body(containsString("SignatureDoesNotMatch"));
+    }
+
+    @Test
+    @Order(25)
+    void presignedPutWithUnsignedChecksumHeaderIsRejected() {
+        String bucket = "auth-presigned-checksum-bucket";
+        String key = "part.bin";
+        String path = "/" + bucket + "/" + key;
+        given().filter(LOCAL_SIGNER).when().put("/" + bucket).then().statusCode(200);
+
+        try {
+            String signature = presignedSignature("PUT", path, "test", "test", "3600");
+            Map<String, String> checksumHeaders = Map.of(
+                    "x-amz-checksum-algorithm", "CRC32",
+                    "x-amz-checksum-crc32", "y/Q5Jg==",
+                    "x-amz-checksum-crc32c", "4waSgw==",
+                    "x-amz-checksum-crc64nvme", "rosUhgp5mIg=",
+                    "x-amz-checksum-sha1", "98O8HYCOBHMq32eZZczDTKeuNEE=",
+                    "x-amz-checksum-sha256", "FeKw08M4keuw8e9gnsQZQgwg4yDOlMZfvIwzEkSOsiU=",
+                    "x-amz-sdk-checksum-algorithm", "CRC32");
+            for (Map.Entry<String, String> checksum : checksumHeaders.entrySet()) {
+                presignedRequest(signature)
+                    .header(checksum.getKey(), checksum.getValue())
+                    .body("123456789")
+                .when()
+                    .put(path)
+                .then()
+                    .statusCode(403)
+                    .body("Error.Code", equalTo("AccessDenied"))
+                    .body("Error.Message", equalTo(
+                            "There were headers present in the request which were not signed"))
+                    .body("Error.HeadersNotSigned", equalTo(checksum.getKey()));
+            }
+
+            given()
+                .filter(LOCAL_SIGNER)
+            .when()
+                .get(path)
+            .then()
+                .statusCode(404);
+        } finally {
+            given().filter(LOCAL_SIGNER).when().delete("/" + bucket);
+        }
     }
 
     @Test
@@ -1959,6 +2003,165 @@ class S3AuthEnforcementIntegrationTest {
             .body(containsString("AuthorizationHeaderMalformed"));
     }
 
+    @Test
+    @Order(54)
+    void presignedPutCorsPreflightSkipsOnlyPreflightSignatureValidation() {
+        String bucket = "auth-presigned-cors-" + Long.toUnsignedString(System.nanoTime(), 36);
+        String key = "upload.txt";
+        String path = "/" + bucket + "/" + key;
+        String signature = presignedSignature("PUT", path, "test", "test", "3600");
+        String tamperedSignature = signature.substring(0, signature.length() - 1)
+                + (signature.endsWith("0") ? "1" : "0");
+        String corsConfiguration = """
+                <CORSConfiguration>
+                  <CORSRule>
+                    <AllowedOrigin>https://app.example.com</AllowedOrigin>
+                    <AllowedMethod>PUT</AllowedMethod>
+                    <AllowedHeader>content-type</AllowedHeader>
+                    <MaxAgeSeconds>600</MaxAgeSeconds>
+                  </CORSRule>
+                </CORSConfiguration>
+                """;
+
+        try {
+            given()
+                .filter(LOCAL_SIGNER)
+            .when()
+                .put("/" + bucket)
+            .then()
+                .statusCode(200);
+
+            given()
+                .filter(LOCAL_SIGNER)
+                .contentType("application/xml")
+                .body(corsConfiguration)
+            .when()
+                .put("/" + bucket + "?cors")
+            .then()
+                .statusCode(200);
+
+            presignedRequest(signature)
+                .header("Origin", "https://app.example.com")
+                .header("Access-Control-Request-Method", "PUT")
+                .header("Access-Control-Request-Headers", "content-type")
+            .when()
+                .options(path)
+            .then()
+                .statusCode(200)
+                .header("Access-Control-Allow-Origin", equalTo("https://app.example.com"))
+                .header("Access-Control-Allow-Methods", containsString("PUT"))
+                .header("Access-Control-Allow-Headers", equalTo("content-type"))
+                .header("Access-Control-Max-Age", equalTo("600"));
+
+            // OPTIONS alone is not a CORS preflight and must not turn a PUT signature into a
+            // general authentication bypass.
+            presignedRequest(signature)
+            .when()
+                .options(path)
+            .then()
+                .statusCode(403)
+                .body(containsString("SignatureDoesNotMatch"));
+
+            // Origin without Access-Control-Request-Method is not a preflight either.
+            presignedRequest(signature)
+                .header("Origin", "https://app.example.com")
+            .when()
+                .options(path)
+            .then()
+                .statusCode(403)
+                .body(containsString("SignatureDoesNotMatch"));
+
+            presignedRequest(tamperedSignature)
+                .header("Origin", "https://app.example.com")
+                .contentType("text/plain")
+                .body("tampered")
+            .when()
+                .put(path)
+            .then()
+                .statusCode(403)
+                .body(containsString("SignatureDoesNotMatch"));
+
+            presignedRequest(signature)
+                .header("Origin", "https://app.example.com")
+                .contentType("text/plain")
+                .body("uploaded")
+            .when()
+                .put(path)
+            .then()
+                .statusCode(200)
+                .header("Access-Control-Allow-Origin", equalTo("https://app.example.com"));
+        } finally {
+            given().filter(LOCAL_SIGNER).when().delete(path);
+            given().filter(LOCAL_SIGNER).when().delete("/" + bucket);
+        }
+    }
+
+    @Test
+    @Order(55)
+    void bucketPolicyDenyHoldsForARequestSignedInAnotherPartition() {
+        String bucket = "auth-partition-deny-" + Long.toUnsignedString(System.nanoTime(), 36);
+        String key = "guarded.txt";
+
+        given().filter(LOCAL_SIGNER).when().put("/" + bucket).then().statusCode(200);
+        given()
+            .filter(LOCAL_SIGNER)
+            .body("original")
+        .when()
+            .put("/" + bucket + "/" + key)
+        .then()
+            .statusCode(200);
+        given()
+            .filter(LOCAL_SIGNER)
+            .contentType("application/json")
+            .body("""
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Deny",
+                      "Principal": "*",
+                      "Action": ["s3:GetObject", "s3:PutObject"],
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }
+                """.formatted(bucket))
+        .when()
+            .put("/" + bucket + "?policy")
+        .then()
+            .statusCode(200);
+
+        // The bucket lives in us-east-1, so its policy names it arn:aws: even when a same-account
+        // caller signs for a China region, and the deny has to match as written.
+        S3RequestSigner chinaSigner = LOCAL_SIGNER.inRegion("cn-north-1");
+        given()
+            .filter(chinaSigner)
+            .body("overwritten")
+        .when()
+            .put("/" + bucket + "/" + key)
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+
+        given()
+            .filter(chinaSigner)
+        .when()
+            .get("/" + bucket + "/" + key)
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+    }
+
+    private static RequestSpecification presignedRequest(String signature) {
+        return given()
+                .queryParam("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+                .queryParam("X-Amz-Credential", credential("test"))
+                .queryParam("X-Amz-Date", SIGNING_TIMESTAMP)
+                .queryParam("X-Amz-Expires", "3600")
+                .queryParam("X-Amz-SignedHeaders", "host")
+                .queryParam("X-Amz-Signature", signature);
+    }
+
     private static HttpResponse<String> putWithoutContentType(String pathAndQuery, byte[] body,
                                                               S3RequestSigner signer) throws Exception {
         URI uri = URI.create("http://localhost:" + io.restassured.RestAssured.port + "/" + pathAndQuery);
@@ -2157,12 +2360,5 @@ class S3AuthEnforcementIntegrationTest {
                   </OutputSerialization>
                 </SelectObjectContentRequest>
                 """;
-    }
-
-    public static final class S3AuthProfile implements QuarkusTestProfile {
-        @Override
-        public Map<String, String> getConfigOverrides() {
-            return Map.of("floci.services.s3.enforce-auth", "true");
-        }
     }
 }

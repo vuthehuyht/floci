@@ -2,11 +2,14 @@ package io.github.hectorvent.floci.services.ses;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.ses.model.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
+import java.time.Instant;
+import java.util.Arrays;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -17,7 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Unit tests for the request-parsing helpers shared by the SES v2 controllers. Each helper's
+ * Unit tests for the helpers shared by the SES v2 controllers. Each helper's
  * accept / reject split and its wording were previously pinned only through the controller
  * integration tests; these pin them directly so the controllers can move without re-proving them.
  */
@@ -196,5 +199,64 @@ class SesV2JsonTest {
             assertEquals(field + " is required.", assertAws("BadRequestException", 400,
                     () -> SesV2Json.readRequiredStringField(node, field)).getMessage());
         }
+    }
+
+    @Test
+    void parseSuppressedReasons_absentIsEmpty_elementsFollowAwsCoercion() {
+        assertEquals(List.of(),
+                SesV2Json.parseSuppressedReasons(json("{}").path("SuppressedReasons")));
+        assertEquals(List.of(), SesV2Json.parseSuppressedReasons(json("null")));
+        assertEquals(List.of("BOUNCE", "COMPLAINT"),
+                SesV2Json.parseSuppressedReasons(json("[\"BOUNCE\",\"COMPLAINT\"]")));
+        // A null element passes deserialization and is left to the service-layer value check.
+        assertEquals(Arrays.asList("BOUNCE", null),
+                SesV2Json.parseSuppressedReasons(json("[\"BOUNCE\",null]")));
+        assertEquals("Expected list or null", assertAws("SerializationException", 400,
+                () -> SesV2Json.parseSuppressedReasons(json("\"BOUNCE\""))).getMessage());
+        assertEquals("NUMBER_VALUE can not be converted to a String",
+                assertAws("SerializationException", 400,
+                        () -> SesV2Json.parseSuppressedReasons(json("[1]"))).getMessage());
+        assertEquals("TRUE_VALUE can not be converted to a String",
+                assertAws("SerializationException", 400,
+                        () -> SesV2Json.parseSuppressedReasons(json("[true]"))).getMessage());
+        assertEquals("Start of structure or map found where not expected.",
+                assertAws("SerializationException", 400,
+                        () -> SesV2Json.parseSuppressedReasons(json("[{}]"))).getMessage());
+    }
+
+    @Test
+    void parseSendingEnabled_missingIsFalse_otherwiseCoerces() {
+        assertFalse(SesV2Json.parseSendingEnabled(json("{}").path("SendingEnabled")));
+        assertTrue(SesV2Json.parseSendingEnabled(json("true")));
+        assertTrue(SesV2Json.parseSendingEnabled(json("\"yes\"")));
+        assertAws("SerializationException", 400, () -> SesV2Json.parseSendingEnabled(json("null")));
+        assertAws("SerializationException", 400, () -> SesV2Json.parseSendingEnabled(json("0")));
+    }
+
+    @Test
+    void epochSeconds_keepsMillisecondFraction() {
+        assertEquals(1_790_312_384.592, SesV2Json.epochSeconds(Instant.ofEpochMilli(1_790_312_384_592L)));
+    }
+
+    @Test
+    void epochSeconds_dropsSubMillisecondPrecision() {
+        assertEquals(1_790_312_384.592,
+                SesV2Json.epochSeconds(Instant.ofEpochSecond(1_790_312_384L, 592_999_999L)));
+    }
+
+    @Test
+    void putTimestamp_writesDecimalNumber() {
+        ObjectNode node = MAPPER.createObjectNode();
+        SesV2Json.putTimestamp(node, "CreatedTimestamp", Instant.ofEpochMilli(1_790_312_384_592L));
+
+        assertEquals("{\"CreatedTimestamp\":1.790312384592E9}", node.toString());
+    }
+
+    @Test
+    void putTimestamp_skipsNull() {
+        ObjectNode node = MAPPER.createObjectNode();
+        SesV2Json.putTimestamp(node, "CompletedTimestamp", null);
+
+        assertFalse(node.has("CompletedTimestamp"));
     }
 }

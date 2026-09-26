@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.rds.proxy;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.rds.container.RdsBackendGate;
 import io.github.hectorvent.floci.services.rds.model.DatabaseEngine;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -20,28 +21,36 @@ public class RdsProxyManager {
     private final RdsSigV4Validator sigV4Validator;
     private final RdsProxyTlsCertificates tlsCertificates;
     private final EmulatorConfig config;
+    private final RdsBackendGate backendGate;
     private final ConcurrentHashMap<String, RdsAuthProxy> proxies = new ConcurrentHashMap<>();
 
     @Inject
     public RdsProxyManager(RdsSigV4Validator sigV4Validator, RdsProxyTlsCertificates tlsCertificates,
-                           EmulatorConfig config) {
+                           EmulatorConfig config, RdsBackendGate backendGate) {
         this.sigV4Validator = sigV4Validator;
         this.tlsCertificates = tlsCertificates;
         this.config = config;
+        this.backendGate = backendGate;
+    }
+
+    RdsProxyManager(RdsSigV4Validator sigV4Validator, RdsProxyTlsCertificates tlsCertificates,
+                    EmulatorConfig config) {
+        this(sigV4Validator, tlsCertificates, config, RdsBackendGate.OPEN);
     }
 
     public synchronized void startProxy(String instanceId, DatabaseEngine engine, boolean iamEnabled,
                                         int proxyPort, String backendHost, int backendPort,
                                         String advertisedHost,
                                         String masterUsername, String masterPassword, String dbName,
-                                        RdsAuthProxy.MasterPasswordCheck passwordValidator) {
+                                        RdsAuthProxy.MasterPasswordCheck passwordValidator,
+                                        RdsProxyBinding binding) {
         tlsCertificates.ensureHost(advertisedHost);
         EmulatorConfig.RdsServiceConfig rdsConfig = config.services().rds();
         RdsAuthProxy proxy = new RdsAuthProxy(
                 instanceId, backendHost, backendPort, engine, iamEnabled,
                 masterUsername, masterPassword, dbName, sigV4Validator, tlsCertificates, passwordValidator,
                 rdsConfig.proxyHandshakeTimeoutMillis(), rdsConfig.proxyBackendConnectTimeoutMillis(),
-                rdsConfig.proxyMaxConnections());
+                rdsConfig.proxyMaxConnections(), binding, backendGate);
         try {
             proxy.start(proxyPort);
         } catch (IOException e) {

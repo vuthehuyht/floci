@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.lambda;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.lambda.model.EventSourceMapping;
@@ -371,6 +372,9 @@ public class LambdaController {
 
         if (esm.getMaximumRetryAttempts() != null) {
             node.put("MaximumRetryAttempts", esm.getMaximumRetryAttempts());
+        }
+        if (esm.getMaximumRecordAgeInSeconds() != null) {
+            node.put("MaximumRecordAgeInSeconds", esm.getMaximumRecordAgeInSeconds());
         }
 
         if (esm.getDestinationConfig() != null && esm.getDestinationConfig().getOnFailure() != null) {
@@ -829,7 +833,7 @@ public class LambdaController {
         if (arnParts.length > 3 && !arnParts[3].isBlank()) {
             region = arnParts[3];
         }
-        return "arn:aws:lambda:" + region + "::runtime:" + runtimeVersionId(fn.getRuntime());
+        return AwsArnUtils.Arn.of("lambda", region, "", "runtime:" + runtimeVersionId(fn.getRuntime())).toString();
     }
 
     /**

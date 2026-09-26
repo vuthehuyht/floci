@@ -65,6 +65,19 @@ class VtlTemplateEngineTest {
     }
 
     @Test
+    void parsedMapAndCollectionMethodsInResponseTemplate() {
+        String template = "#set($parsed = $util.parseJson($input.body))"
+                + "#if($parsed.headers)$parsed.headers.isEmpty()|$parsed.headers.size()|"
+                + "#foreach($entry in $parsed.headers.entrySet())$entry.getKey()=$entry.getValue()#end|"
+                + "$parsed.items.isEmpty()|$parsed.items.size()|#foreach($item in $parsed.items)$item#end#end";
+
+        String result = engine.evaluate(template, ctx("{\"headers\":{\"x-test\":\"yes\"},\"items\":[\"a\",\"b\"]}"))
+                .body().trim();
+
+        assertEquals("false|1|x-test=yes|false|2|ab", result);
+    }
+
+    @Test
     void inputPath() {
         String result = engine.evaluate("$input.path('$.name')", ctx("{\"name\":\"Carol\"}")).body();
         assertEquals("Carol", result);
@@ -484,5 +497,78 @@ class VtlTemplateEngineTest {
         VtlTemplateEngine.EvaluateResult result = engine.evaluate("hello", ctx("{}"));
         assertNull(result.statusOverride());
         assertTrue(result.headerOverrides().isEmpty());
+    }
+
+    // ────────── Sandbox: reflection escapes must be blocked ──────────
+
+    @Test
+    void security_getClassLoaderIsNotReachable() {
+        // When SecureUberspector blocks a method call, Velocity (in non-strict mode, the default
+        // here) renders the literal, unresolved reference text instead of throwing or evaluating
+        // it. Getting the raw template text back verbatim (rather than an actual ClassLoader
+        // instance's toString, e.g. "...ClassLoader@<hash>") proves the call was blocked. Note
+        // this literal text still contains the substring "ClassLoader" (it's the method name), so
+        // a plain assertFalse(result.contains("ClassLoader")) would wrongly fail here.
+        String template = "$util.getClass().getClassLoader()";
+        String result = engine.evaluate(template, ctx("{}")).body();
+        assertEquals(template, result,
+                "expected getClassLoader() to be blocked by SecureUberspector and rendered as an "
+                        + "unresolved literal reference, but got: " + result);
+    }
+
+    @Test
+    void security_classForNameIsNotReachable() {
+        String result = engine.evaluate(
+                "$util.getClass().forName('java.lang.System').getName()", ctx("{}")).body();
+        assertNotEquals("java.lang.System", result,
+                "expected Class.forName(...) to be blocked by SecureUberspector, but it resolved: " + result);
+    }
+
+    @Test
+    void security_runtimeClassIsNotLoadableByName() {
+        String result = engine.evaluate(
+                "$util.getClass().forName('java.lang.Runtime').getName()", ctx("{}")).body();
+        assertNotEquals("java.lang.Runtime", result,
+                "expected Class.forName('java.lang.Runtime') to be blocked, but it resolved: " + result);
+    }
+
+    @Test
+    void security_processBuilderClassIsNotLoadableByName() {
+        String result = engine.evaluate(
+                "$util.getClass().forName('java.lang.ProcessBuilder').getName()", ctx("{}")).body();
+        assertNotEquals("java.lang.ProcessBuilder", result,
+                "expected Class.forName('java.lang.ProcessBuilder') to be blocked, but it resolved: " + result);
+    }
+
+    @Test
+    void security_getClassStillPermitsGetName() {
+        // getName() on a Class receiver must remain permitted (SecureUberspector's one exception),
+        // so ordinary reflection-free VTL idioms relying on it (if any) keep working.
+        String result = engine.evaluate("$util.getClass().getName()", ctx("{}")).body();
+        assertTrue(result.contains("UtilVariable"), "expected getName() on Class to still work, got: " + result);
+    }
+
+    // ────────── Sandbox: runaway loop and output limits ──────────
+
+    @Test
+    void security_foreachLoopCountIsBounded() {
+        // 50,000 requested iterations, each writing a single character. With no cap this renders
+        // 50,000 characters; the configured default (ApiGatewayServiceConfig.vtlMaxLoops = 10000)
+        // must cap the loop well before that.
+        String template = "#foreach($i in [1..50000])x#end";
+        String result = engine.evaluate(template, ctx("{}")).body();
+        assertEquals(10000, result.length(),
+                "expected #foreach to be capped at the configured vtlMaxLoops, but rendered " + result.length()
+                        + " characters");
+    }
+
+    @Test
+    void security_outputSizeIsBounded() {
+        // 21 doublings of a 2-character seed produce roughly 4 million characters, comfortably
+        // over the default 1,048,576-character output cap, in only 21 loop iterations (well under
+        // the 10,000-iteration loop cap), so this exercises the output limit specifically.
+        String template = "#set($s = \"xy\")#foreach($i in [1..21])#set($s = \"$s$s\")#end$s";
+        assertThrows(RuntimeException.class, () -> engine.evaluate(template, ctx("{}")),
+                "expected output exceeding the configured vtlMaxOutputChars to throw");
     }
 }
